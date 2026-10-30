@@ -1,0 +1,4 @@
+/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.14.3.rel1.macosaarch64_1.0.0.202602081740/tools/bin/arm-none-eabi-gcc
+-DSTM32G474xx -IInc -IDrivers/CMSIS/Include -IDrivers/CMSIS/Device/ST/STM32G4xx/Include -DBUCK_DIAGNOSTICS=1 -DBUCK_SCOPE_PIN=0 -DBUCK_AUTO_START=1 -DBUCK_USE_HSE=0 -DBUCK_ESTIMATOR=0 -DBUCK_EST_DISPLAY=1 -DBUCK_SAMPLE_LEAD_CYCLES=144
+-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -std=gnu11 -O3 -g3 -ffunction-sections -fdata-sections -fno-common -fno-builtin -Wall -Wextra -Wshadow -Wdouble-promotion -MMD -MP
+-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -TSTM32G474RETX_FLASH.ld --specs=nano.specs --specs=nosys.specs -Wl,--gc-sections,-Map=b-pi/Buck_Voltage_Mode.map -Wl,--print-memory-usage

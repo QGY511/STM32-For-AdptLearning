@@ -1,0 +1,2037 @@
+% NOTE (buck_obs_apt, 29 Oct 2026): this memo is Buck_disturb_obs's and describes the base
+% controller only (the per-cycle loop, unchanged here with TOC and learning off). The TOC pulse
+% pair and the learning paths added in stage 2 are described in README.md (part 1).
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xltabular}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage[hidelinks]{hyperref}
+
+% Code identifiers with underscores, typeset verbatim.
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+% Marks the option that was chosen.
+\newcommand{\chosen}{\hfill$\checkmark$\,\textbf{selected}}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+
+\setlist[description]{font=\normalfont\bfseries, leftmargin=1.5em}
+\setlist[enumerate,1]{label=(\alph*), nosep, leftmargin=2em}
+\setlist[enumerate,2]{label=(\alph*), nosep, leftmargin=2em}
+
+\setlength{\emergencystretch}{2em}
+
+\begin{document}
+
+% ============================================================
+\begin{center}
+{\Large\bfseries Memorandum}
+\end{center}
+
+\noindent
+\begin{tabularx}{\linewidth}{@{}l L@{}}
+\textbf{To:}   & Project owner, \code{Buck_Current_Mode} \\
+\textbf{From:} & Claude Code (firmware implementation session) \\
+\textbf{Date:} & 26 September 2026 (updated 28 October 2026) \\
+\textbf{Re:}   & Questions and answers on the NUCLEO-G474RE
+                 average-current-mode buck firmware \\
+\end{tabularx}
+
+\medskip\hrule\medskip
+
+% ============================================================
+\section{Purpose}
+% ============================================================
+
+The specification ended with the instruction to ask about anything
+unclear instead of deciding. While implementing the firmware I asked
+sixteen questions in four rounds. This memo records each question,
+the options offered, your answer, and how the answer appears in the
+code. It also lists the implementation choices I made without
+asking, and the questions raised after the implementation that
+still need your decision.
+
+The firmware builds without warnings in the Makefile and in both
+CubeIDE configurations, and the host tests and the closed-loop
+simulation pass. Since 27 September it also runs on the board with the
+power stage (Section~\ref{sec:followup}); the two-sample
+$v_{\mathrm{out}}$ acquisition added later that day ran on the board in
+the Buck\_disturb\_obs build you ran on 27 October (below). The copy
+BUCK\_Adpt\_Learning (24 October, Section~\ref{sec:followup1024})
+has not run on the board. This copy, Buck\_disturb\_obs (25 October,
+Section~\ref{sec:followup1025obs}), tripped fault~5 on the first pass
+after arming on its first board run that evening; the fix
+(Section~\ref{sec:followup1025f}, bin e5c7798f\ldots) ran on the board on
+27 October: you reported that it works (no data from that run were read).
+The clock optimisation of 28 October (Section~\ref{sec:followup1028}; bin
+5b99a0d5\ldots, the applied 2f144a53\ldots{} with the observer's prediction
+pinned in the post pass) gives the same results bit for bit but for one
+exception, 5 debugger-stall scenarios in which the 25 October build trips
+its own fault~5 (row~9 there). It has not run on the board yet.
+
+% ============================================================
+\section{Summary of Answers}
+% ============================================================
+
+\begin{table}[H]
+\centering
+\caption{All sixteen questions. Answers in quotation marks were typed
+by you rather than picked from the options.}
+\label{tab:summary}
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}r>{\raggedright\arraybackslash}p{0.25\linewidth}LL@{}}
+\toprule
+\textbf{\#} & \textbf{Question} & \textbf{Answer} & \textbf{Where in the code} \\
+\midrule
+1  & Loop structure; which $u[k]$ enters $S[k]$
+   & Cascaded; $u[k]=i_{\mathrm{ref}}[k]$, the voltage-PI output in A
+     (24 October: $S$ uses the duty change $\Delta d$ instead; 25 October:
+     $S=a e_v^2+b e_v+c$, no second variable)
+   & \code{buck_ctrl_fast()}; \code{out.i_ref} \\
+2  & Feedback of the inner current loop
+   & Corrected estimate $\hat{\bar{i}}_L[k]$
+   & current-PI error $i_{\mathrm{ref}}-\hat{\bar{i}}_L[k]$ \\
+3  & Acquisition of $\bar{i}_{L,\mathrm{m}}[k]$
+   & 4 samples per period, averaged in hardware (ADC oversampling)
+   & HRTIM Master CMP1--4 $\to$ ADC2, 4$\times$ oversampling \\
+4  & Firmware style and clock
+   & Register-level CMSIS, 168\,MHz from HSI
+   & \code{clock_init()}; HRTIM period 8960 \\
+\midrule
+5  & Source of $V_{\mathrm{in}}$
+   & Constant 6\,V
+   & \code{BUCK_VIN_V} \\
+6  & A0 scaling and $V_{\mathrm{ref}}$
+   & A0 direct, $V_{\mathrm{ref}}=1000$ counts
+   & \code{tune.vref_counts} \\
+7  & A1 output at 0\,A
+   & 1.65\,V (bidirectional); corrected later to 0\,V at 0\,A
+   & \code{tune.isense_zero} $=0$ (was 2048) \\
+8  & Inductor resistance $r_L$
+   & 114\,m$\Omega$
+   & \code{BUCK_RL_OHM} \\
+\midrule
+9  & PI gains and limits
+   & ``use textbook 45 phase margin''
+   & \code{tools/pi_design.py}; crossovers in Q13 \\
+10 & Correction factor $\alpha_I$
+   & $\tau_c=50\,\mu\mathrm{s}$, giving $\alpha_I=0.03278$
+   & \code{BUCK_ALPHA_I}; \code{tune.alpha_i} \\
+11 & Trigger $\rho$ and $S_{\mathrm{th}}$
+   & $\rho=0$, $S_{\mathrm{th}}=0.01$; $S_{\mathrm{th}}$ changed later to 1;
+     $\Delta d$ for $\Delta u$ on 24 October; $\rho$ removed on 25 October
+   & \code{tune.s_th}; \code{tune.score_a}, \code{_b}, \code{_c}
+     (\code{tune.rho} until 25 October) \\
+12 & Scaling of $\hat{I}$ on A2
+   & 0--3.3\,V $\leftrightarrow$ 0--10\,A
+   & \code{BUCK_DAC_FULL_SCALE_A} \\
+\midrule
+13 & Crossover pair for the $45^\circ$ design
+   & $f_{ci}=60\,\mathrm{kHz}$, $f_{cv}=6\,\mathrm{kHz}$
+   & \code{BUCK_KP_I}, \code{BUCK_KI_I}, \code{BUCK_KP_V}, \code{BUCK_KI_V} \\
+14 & Dead time in $T_{\mathrm{on}}[k]$
+   & ``consider deadtime as off time''
+   & CMP1 $=D\cdot 8960+272$ \\
+15 & Volts per A0 count
+   & $3.3\,\mathrm{V}/4096=805.7\,\mu\mathrm{V}$
+   & \code{BUCK_V_PER_COUNT} \\
+16 & Start-up of the gates
+   & Off until a debugger command
+   & \code{g_buck.command} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ============================================================
+\section{Round 1: Control Architecture}
+% ============================================================
+
+\subsection*{Q1.\ Loop structure and the meaning of $u[k]$}
+\begin{description}
+\item[Why asked.] The specification calls for average-current-mode
+control but describes a single PI with output $u[k]$, and
+$\Delta u[k]$ enters the trigger score $S[k]$.
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Cascaded, $u={}$voltage-PI output: the outer voltage PI gives
+        the average-current reference $i_{\mathrm{ref}}$; the inner
+        current PI gives the duty; $\Delta u$ is in amperes.\chosen
+  \item Cascaded, $u={}$current-PI output: $\Delta u$ is in duty units.
+  \item Single PI from the voltage error to duty (voltage mode; the
+        estimator only feeds the DAC).
+  \end{enumerate}
+\item[Implemented as.] $u[k]=i_{\mathrm{ref}}[k]$ in amperes, and
+$\Delta u[k]=i_{\mathrm{ref}}[k]-i_{\mathrm{ref}}[k-1]$ in $S[k]$.
+\item[Change.] On 24 October (BUCK\_Adpt\_Learning) $S[k]$ uses the duty
+change $\Delta d[k]=d[k]-d[k-1]$ of the current PI instead of $\Delta u$
+(Section~\ref{sec:followup1024}). On 25 October the $\Delta d$ term was
+removed: $S=a e_v^2+b e_v+c$ (same section).
+\end{description}
+
+\subsection*{Q2.\ Feedback of the inner current loop}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item The measured cycle average $\bar{i}_{L,\mathrm{m}}[k]$ from A1;
+        the estimator is used only for $\hat{I}$ and the trigger.
+  \item The measurement-corrected estimate $\hat{\bar{i}}_L[k]$ of the
+        specification's corrected-average equation.\chosen
+  \end{enumerate}
+\item[Implemented as.] The current PI acts on
+$i_{\mathrm{ref}}[k]-\hat{\bar{i}}_L[k]$.
+\end{description}
+
+\subsection*{Q3.\ Acquisition of the measured cycle average}
+\begin{description}
+\item[Why asked.] The specification defines
+$\bar{i}_{L,\mathrm{m}}[k]$ but not how it is sampled from the
+650\,kHz sensor on A1.
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Four samples per period at $T/8$, $3T/8$, $5T/8$, $7T/8$,
+        averaged by ADC oversampling; no CPU cost; window aligned to
+        the switching cycle.\chosen
+  \item One sample at mid on-time (sensitive to the sensor's
+        $\approx 245\,\mathrm{ns}$ lag).
+  \item One sample plus a computed ripple correction, as in
+        \code{Buck_Voltage_Mode}.
+  \end{enumerate}
+\item[Implemented as.] HRTIM Master CMP1--CMP4 drive ADC trigger~3.
+ADC2 runs triggered $4\times$ oversampling with no shift, so one
+result per cycle holds the sum of the four samples.
+\end{description}
+
+\subsection*{Q4.\ Firmware style and clock}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Register-level CMSIS, 168\,MHz from HSI: HRTIM $\times 32$
+        gives exactly $8960$ ticks $=600.000\,\mathrm{kHz}$; interrupt
+        handler placed in CCM RAM.\chosen
+  \item Register-level CMSIS, 168\,MHz from the 24\,MHz HSE (crystal
+        accuracy; the board's HSE routing must be checked).
+  \item HAL/LL generated by CubeMX (heavier code path; 170\,MHz cannot
+        give an exact 600\,kHz period).
+  \end{enumerate}
+\item[Implemented as.] HSI16 $/4\times 84$ (336\,MHz VCO), R$/2$ gives
+168\,MHz for the CPU and HRTIM, P$/6$ gives 56\,MHz for the ADCs. The
+period is 280 CPU clocks. The control code runs from CCM RAM as offered,
+but as a polling loop instead of an interrupt handler. This departs from
+the option text and was not asked; see C1.
+\end{description}
+
+% ============================================================
+\section{Round 2: Sensing and Model Parameters}
+% ============================================================
+
+\subsection*{Q5.\ Source of $V_{\mathrm{in}}[k]$}
+\begin{description}
+\item[Why asked.] The estimator needs $V_{\mathrm{in}}[k]$, but no
+input-voltage pin is assigned.
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Constant 6\,V.\chosen
+  \item Add a $V_{\mathrm{in}}$ sense pin.
+  \end{enumerate}
+\item[Implemented as.] $V_{\mathrm{in}}=6\,\mathrm{V}$ at compile time
+(\code{BUCK_VIN_V}).
+\end{description}
+
+\subsection*{Q6.\ A0 scaling and the reference $V_{\mathrm{ref}}$}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item A0 $=v_{\mathrm{out}}$ directly, $V_{\mathrm{ref}}=1.0\,\mathrm{V}$.
+  \item A0 directly, $V_{\mathrm{ref}}=1000$ counts
+        ($\approx 0.8\,\mathrm{V}$), as in
+        \code{Buck_Voltage_Mode}.\chosen
+  \item Divider of $0.4128\,\mathrm{V/V}$, $V_{\mathrm{ref}}=1.0\,\mathrm{V}$.
+  \end{enumerate}
+\item[Implemented as.] \code{tune.vref_counts} $=1000$, which is
+$0.8057\,\mathrm{V}$ with the scale of Q15. It can be changed live.
+\end{description}
+
+\subsection*{Q7.\ A1 output at zero inductor current}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item 0\,V at 0\,A (unidirectional; negative current clips).
+  \item 1.65\,V at 0\,A (bidirectional).\chosen
+  \item Calibrate automatically at start-up with the gates off.
+  \end{enumerate}
+\item[Implemented as.] Zero at 2048 counts and
+$20.14\,\mathrm{mA}$ per count. The zero is live-tunable as
+\code{tune.isense_zero} and the gain as \code{tune.isense_gain}, so the
+zero can be trimmed by hand from the debugger. There is no automatic
+calibration.
+\item[Correction.] On 27 September you corrected this answer: A1 reads
+0\,V at 0\,A, as in option~(a). The default zero is now 0 counts
+(\code{BUCK_ISENSE_ZERO_V} $=0$), and negative inductor current reads as
+0\,A. In simulation the clipping changes nothing from about 1\,A up and
+makes the measured average read high at lighter load (about
+$+0.1\,\mathrm{A}$ at 0.5\,A).
+\end{description}
+
+\subsection*{Q8.\ Inductor series resistance $r_L$}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item $114\,\mathrm{m}\Omega$, the DC fit from
+        \code{Buck_Voltage_Mode} (includes FET and path
+        resistance).\chosen
+  \item $0\,\Omega$ ($\theta=0$).
+  \end{enumerate}
+\item[Implemented as.] $\theta=r_L/L=3.45\times 10^{5}\,\mathrm{s}^{-1}$,
+so $\theta T_{\mathrm{sw}}=0.58<2$. Every Pad\'e $a(\tau)$ is therefore
+positive and $\kappa_I$ is always defined.
+\end{description}
+
+% ============================================================
+\section{Round 3: Gains, Correction, Trigger and DAC}
+% ============================================================
+
+\subsection*{Q9.\ PI gains and limits}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Reuse the gains of \code{Buck_Voltage_Mode}: voltage PI
+        $K_p=30.8\,\mathrm{A/V}$, $K_i=1.155\times10^{6}\,\mathrm{A/(V\,s)}$;
+        current PI $K_p=0.0279\,\mathrm{A^{-1}}$,
+        $K_i=1570\,\mathrm{(A\,s)^{-1}}$; limits $i_{\mathrm{ref}}$
+        $-2\ldots10\,\mathrm{A}$ and duty 10--50\,\%.
+  \item Enter values.
+  \end{enumerate}
+\item[Answer.] Typed: ``use textbook 45 phase margin''.
+\item[Implemented as.] Both PIs are designed for $45^\circ$ phase
+margin by \code{tools/pi_design.py}. The crossover frequencies were
+asked in Q13. The answer did not cover the limits, so they were carried
+over from \code{Buck_Voltage_Mode}; they are still open (O2 in
+Section~\ref{sec:open}).
+\end{description}
+
+\subsection*{Q10.\ Measurement-correction factor $\alpha_I$}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item $\tau_c=50\,\mu\mathrm{s}$, so
+        $\alpha_I=1-e^{-T_{\mathrm{sw}}/\tau_c}\approx 0.0328$.\chosen
+  \item Fixed $\alpha_I=0.05$.
+  \item Fixed $\alpha_I=0.1$.
+  \end{enumerate}
+\item[Implemented as.] $\alpha_I=0.03278$, a constant because
+$T_{\mathrm{sw}}$ is fixed. It is evaluated at compile time and can be
+changed live (\code{tune.alpha_i}).
+\end{description}
+
+\subsection*{Q11.\ Trigger parameters}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item $\rho=0$, $S_{\mathrm{th}}=0.01$: fires at about
+        $|e_v|\ge 100\,\mathrm{mV}$ or $|\Delta u|\ge 0.1\,\mathrm{A}$.\chosen
+  \item Enter values.
+  \end{enumerate}
+\item[Implemented as.] Both values are live-tunable (\code{tune.rho},
+\code{tune.s_th}); $e_v$ is in volts and $\Delta u$ in amperes.
+\item[Change.] On 27 September you set the default $S_{\mathrm{th}}$ to 1
+(Section~\ref{sec:followup}). On 24 October the second term became the
+duty change $\Delta d$ (a plain number; \code{du_norm} kept its name). On
+25 October the score became $S=a e_v^2+b e_v+c$ (\code{tune.score_a},
+\code{_b}, \code{_c}; defaults 1, 0, 0): $\rho$, the denominators and
+$\Delta d$ are gone, and $S_{\mathrm{th}}$ sets D4 only
+(Section~\ref{sec:followup1024}).
+\end{description}
+
+\subsection*{Q12.\ Scaling of $\hat{I}$ on the A2 DAC}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item $40\,\mathrm{mV/A}$ with 1.65\,V at 0\,A, the same scale as A1.
+  \item $0$--$3.3\,\mathrm{V}\leftrightarrow 0$--$10\,\mathrm{A}$
+        ($0.33\,\mathrm{V/A}$, unipolar).\chosen
+  \item 1.65\,V at 0\,A, $\pm 10\,\mathrm{A}$ ($0.165\,\mathrm{V/A}$).
+  \end{enumerate}
+\item[Implemented as.] Full scale 10\,A. Negative estimates clip at 0\,V
+and estimates above 10\,A clip at 3.3\,V.
+\end{description}
+
+% ============================================================
+\section{Round 4: Follow-up Questions}
+% ============================================================
+
+\subsection*{Q13.\ Crossover frequencies for the $45^\circ$ design}
+\begin{description}
+\item[Why asked.] Q9 fixes the phase margin but not the crossovers.
+The design is discrete-time and includes the 2-cycle
+sample-to-duty delay and $r_L$. It is evaluated at no load, the worst
+case for the voltage loop.
+\item[Options offered.] See Table~\ref{tab:crossover}.
+\item[Implemented as.] Option~(c), with the exact values
+$K_{p,i}=0.0237243\,\mathrm{A^{-1}}$,
+$K_{i,i}=3338.07\,\mathrm{(A\,s)^{-1}}$,
+$K_{p,v}=9.3448\,\mathrm{A/V}$ and
+$K_{i,v}=285\,353\,\mathrm{A/(V\,s)}$. The current loop has a phase
+margin of $45.0^\circ$ and a gain margin of 3.2\,dB. The voltage loop
+has $45.0^\circ$ (no load) to $61.8^\circ$ (3\,A) of phase margin and
+a gain margin of 15.6\,dB. All closed-loop poles satisfy
+$|z|\le 0.976$ over 0--3\,A. The gains are live-tunable.
+\end{description}
+
+\begin{table}[H]
+\centering
+\caption{Crossover options offered in Q13. Current-PI gains in
+$\mathrm{A^{-1}}$ and $\mathrm{(A\,s)^{-1}}$; voltage-PI gains in
+$\mathrm{A/V}$ and $\mathrm{A/(V\,s)}$. Blank cells were not stated in the option text.}
+\label{tab:crossover}
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}lllllllll@{}}
+\toprule
+ & $f_{ci}$ & $f_{cv}$ & $K_{p,i}$ & $K_{i,i}$ & GM$_i$
+ & $K_{p,v}$ & $K_{i,v}$ & GM$_v$ \\
+\midrule
+(a) & 30\,kHz & 6\,kHz & 0.00089 & 3809 & 7.7\,dB
+    & 9.10  & $2.62\times10^{5}$ & 13.1\,dB \\
+(b) & 40\,kHz & 8\,kHz & 0.00856 & 4758 & 6.4\,dB
+    & 11.68 & $4.55\times10^{5}$ & 13.4\,dB \\
+(c)$\;\checkmark$ & 60\,kHz & 6\,kHz & 0.0237 & 3338 & 3.2\,dB
+    & 9.34  & $2.85\times10^{5}$ & \\
+(d) & 30\,kHz & 3\,kHz & & & & 4.39 & $7.27\times10^{4}$ & 19.6\,dB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{Q14.\ Dead time in the estimator's on-time}
+\begin{description}
+\item[Why asked.] The estimator needs $T_{\mathrm{on}}[k]$, and the
+specification does not say how the $50\,\mathrm{ns}$ dead times are
+counted.
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Commanded on-time minus 50\,ns, with
+        $T_{\mathrm{off}}=T_{\mathrm{sw}}-T_{\mathrm{on}}$.
+  \item Commanded on-time as is, ignoring the dead time.
+  \end{enumerate}
+\item[Answer.] Typed: ``consider deadtime as off time''.
+\item[Implemented as.] The duty $D$ is the physical high-side on-time
+fraction. Both dead times are off-time, in which the inductor sees
+$-v_{\mathrm{out}}$. The compare is CMP1 $=D\cdot 8960+272$ ticks,
+$T_{\mathrm{on}}=D\,T_{\mathrm{sw}}$ and
+$T_{\mathrm{off}}=T_{\mathrm{sw}}-T_{\mathrm{on}}$. This assumption is
+the source of the load-estimate bias in O1.
+\end{description}
+
+\subsection*{Q15.\ Volts per A0 count}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Nominal $3.3\,\mathrm{V}/4096=805.7\,\mu\mathrm{V}$, so
+        $V_{\mathrm{ref}}=0.8057\,\mathrm{V}$.\chosen
+  \item $792.6\,\mu\mathrm{V}$, from the bench measurement in
+        \code{Buck_Voltage_Mode}.
+  \end{enumerate}
+\end{description}
+
+\subsection*{Q16.\ Start-up of the gates}
+\begin{description}
+\item[Options offered.]\leavevmode
+  \begin{enumerate}
+  \item Off until a debugger command: PWM and ADC timing run, the gates
+        stay inactive until \code{command = 1} is written, then a 10\,ms
+        reference soft-start; writing 0 stops.\chosen
+  \item Automatic start after ADC warm-up, with a 10\,ms soft-start.
+  \end{enumerate}
+\item[Implemented as.] The variable is \code{g_buck.command} (the
+option text said \code{g_ctrl.command}). The reference starts at the
+lower of the measured $v_{\mathrm{out}}$ and $V_{\mathrm{ref}}$, then
+moves at a fixed slew of $0.8057\,\mathrm{V}$ per 10\,ms (about
+$0.08\,\mathrm{V/ms}$). The ramp therefore takes 10\,ms from 0\,V to the
+default $V_{\mathrm{ref}}$, and less from a pre-biased output.
+\end{description}
+
+% ============================================================
+\section{Choices Made Without Asking}
+% ============================================================
+
+These choices were made during implementation without a question.
+None of them changes the specified algorithm. C1 departs from the text
+of the option chosen in Q4.
+
+\begin{enumerate}[label=C\arabic*., leftmargin=2.5em]
+\item \textbf{Polling loop instead of an interrupt handler.} The option
+chosen in Q4 said the handler would be an interrupt in CCM RAM. A first
+interrupt-driven version was estimated at about 290 of the 280 clocks
+per period. The loop now runs from CCM SRAM and polls the same
+end-of-conversion flag of ADC1. It is still one update per cycle, and it
+saves about 50 clocks of exception overhead.
+\item \textbf{Pre-computed Pad\'e coefficients.} $a_{\mathrm{on}}$,
+$b_{\mathrm{on}}$, $a_{\mathrm{off}}$, $b_{\mathrm{off}}$ and
+$A_I/H_I$ depend only on CMP1, which takes 3585 values. They are
+computed once at start-up with the specification's formulas (70\,KB
+of RAM), so the results are identical to computing them every cycle.
+\item \textbf{Controller state in CPU registers} while running; it is
+written back to \code{g_buck.st} on a stop.
+\item \textbf{Dead time rounded up} to 68 counts $\times 0.744\,\mathrm{ns}
+= 50.6\,\mathrm{ns}$, so it is never shorter than 50\,ns.
+\item \textbf{Sampling instants of $v_{\mathrm{out}}$:} two samples
+per cycle since 27 September (Section~\ref{sec:followup}), triggered
+about 457 and 100\,ns before the period boundary, in the quiet
+low-side interval. Their mean is $v_{\mathrm{out}}[k+1]$: the end
+value of cycle $k$ and the start value of cycle $k+1$. (Originally
+one sample, triggered 100\,ns before the boundary.)
+\item \textbf{PI form and anti-windup:}
+$C(z)=K_p+K_iT\,z/(z-1)$ with integrator tracking of the output limit.
+\item \textbf{Faults latch} with both gates off (4: ADC overrun or
+missing current result while running, or no ADC1 sample at all;
+5: CMP1 deadline missed; 1, 2, 3, 6: start-up
+timeouts; 8: CPU fault).
+\item \textbf{ADC bulb sampling} on both ADCs: the input is tracked
+from the end of the previous conversion and held 2.5 ADC clocks after
+the trigger (RM0440 Figure~93).
+\code{-DBUCK_ADC_BULB=0} switches back to standard sampling.
+\end{enumerate}
+
+% ============================================================
+\section{Open Questions}
+\label{sec:open}
+% ============================================================
+
+These were raised in the implementation report and have not yet been
+answered.
+
+\begin{enumerate}[label=O\arabic*., leftmargin=2.5em]
+\item \textbf{Bias of the load estimate $\hat{I}$.} In a simulation
+with real body-diode conduction during the dead times, $\hat{I}$ reads
+$-1.35\,\mathrm{A}$ in error at 1\,A load and $+0.35\,\mathrm{A}$ at
+3\,A. When the simulated dead time behaves exactly as the model assumes
+(Q14), the error is only 5--8\,mA, so the code matches the
+specification. At light load the valley current is negative, and the
+high-side body diode conducts during the rising-edge dead time, which
+the model counts as off-time. With $A_I\approx 0.56$ per cycle,
+$\alpha_I=0.033$ is too weak to remove the offset. Regulation is not
+affected, and the measured average is accurate to about
+$\pm 0.04\,\mathrm{A}$. Options:
+  \begin{enumerate}
+  \item accept the bias as specified;
+  \item raise $\alpha_I$ (0.3 halves it to $-0.73$ / $+0.18\,\mathrm{A}$;
+        live-tunable, no code change);
+  \item add a dead-time term that depends on the current direction
+        (not in the specification).
+  \end{enumerate}
+\item \textbf{Limits.} The specification and the answers give none,
+so these were carried over from \code{Buck_Voltage_Mode}: CMP1 between
+10 and 50\,\% of the period (physical $D$ between 6.96 and 46.96\,\%),
+and $i_{\mathrm{ref}}$ between $-2$ and $10\,\mathrm{A}$. Keep them, or
+give values.
+\item \textbf{Arming mid-period.} Writing \code{command = 1} enables
+the gates part-way through a period, so the low side conducts for the
+rest of that period. The estimator models that period with
+$T_{\mathrm{on}}=0$. With a pre-biased output this causes a brief
+negative current. Keep this, or synchronise arming to a period
+boundary.
+\end{enumerate}
+
+\paragraph{Noted risks (no decision needed unless you want a change).}
+\begin{itemize}[nosep]
+\item The current-loop gain margin is 3.2\,dB at the chosen 60\,kHz
+      crossover; option~(a) of Q13 gives 7.7\,dB.
+\item Bulb sampling combined with triggered oversampling has run on
+      the board on ADC2; ADC1 uses it too since the two-sample
+      $v_{\mathrm{out}}$ change, which ran on the board in the build you
+      ran on 27 October (reported working; no data were read; fallback
+      in C8).
+\item The 600\,kHz frequency carries the HSI tolerance (Q4).
+\item $V_{\mathrm{in}}$ is a constant (Q5). At a real 6.5\,V, the
+      simulated $\hat{I}$ error is $-1.85$ / $-0.40\,\mathrm{A}$.
+\item A 1\,A $\to$ 3\,A load step dips about 200\,mV. This is expected
+      from the 6\,kHz voltage crossover with 270\,$\mu$F.
+\end{itemize}
+
+% ============================================================
+\section{Follow-up Requests, 27 September}
+\label{sec:followup}
+% ============================================================
+
+{\small
+\renewcommand{\arraystretch}{1.25}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}L@{}}
+\caption{Requests and questions after the first bench runs.}
+\label{tab:followup}\\
+\toprule
+\textbf{Request or question} & \textbf{Answer and result} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Request or question} & \textbf{Answer and result} \\
+\midrule
+\endhead
+Fault 5 on the board; optimise the loop to fit the timing budget.
+  & The pass was at or above the 280-clock period on average, so each
+    pass started later until the CMP1 write missed its deadline. The loop
+    was restructured without changing the algorithm or the per-cycle
+    outputs: separate multiply and add instead of VMLA, telemetry and
+    tunables every 16th pass, peripheral bases in a register, one branch
+    for the exit tests, and the timer read moved next to the write.
+    Static count: 229--235 $\to$ 177 core clocks per pass. Board result:
+    no fault, \code{busy_max} $=220$. \\
+A1 reads 0\,V at 0\,A, not 1.65\,V.
+  & Corrected (Q7). Negative inductor current reads 0\,A. In simulation
+    this changes nothing from about 1\,A up; at lighter load the measured
+    average reads high (about $+0.1\,\mathrm{A}$ at 0.5\,A and
+    $+0.2\,\mathrm{A}$ at 0.1\,A). \\
+Set $S_{\mathrm{th}}$ to 1.
+  & Default changed to 1. With $\rho=0$, $D4$ fires when
+    $e_v^2+\Delta u^2\ge 1$, e.g.\ $|\Delta u|\ge 1\,\mathrm{A}$ in one
+    cycle, or an overvoltage of 1\,V; the simulated 1\,A $\to$ 3\,A step
+    peaks at $S\approx 0.05$, so $D4$ stays low for it. \\
+How to put more weight on the estimator than on the measurement?
+  & Lower $\alpha_I$ (\code{tune.alpha_i}, i.e.\ a longer $\tau_c$). In
+    simulation this does not reduce the $\hat{I}$ noise at all (0.256\,A
+    rms for every $\alpha_I$ from 0.28 to 0), and it increases the
+    dead-time bias ($-1.35 \to -1.46\,\mathrm{A}$ at 1\,A). \\
+Why is $\hat{I}$ so noisy with $\alpha_I=0$, a steady $v_{\mathrm{out}}$
+and a small $\Delta u$?
+  & $\hat{I}$ multiplies the change between two A0 samples by
+    $C/T_{\mathrm{sw}}=162\,\mathrm{A/V}$: one A0 count is 0.13\,A. A
+    few mV of cycle-to-cycle A0 noise, invisible on the scope, gives the
+    observed jumps. $\alpha_I$ and $\Delta u$ do not enter that term. \\
+Implement the $N$-cycle average for the load current.
+  & $\hat{I}$ on A2 and in \code{out.i_load} is now the mean over the last
+    $N$ cycles, which equals the charge balance over $N$ cycles; the
+    intermediate A0 samples cancel, so A0 noise drops by $N$. You chose
+    $N=16$ as the default; it is live-tunable (\code{tune.iload_n},
+    1--16; $N=1$ is the specification). Simulated at $\pm 2$ counts of A0
+    noise: 0.26 $\to$ 0.016\,A rms; a load step reaches 50\,\% / 90\,\%
+    after 20 / 50\,$\mu$s. It costs 11 clocks per pass (expected
+    \code{busy_max} about 230; fault near 255). This is not the same as
+    sampling A0 several times within one cycle, which would give only
+    $\sqrt{M}$ with $M\le 2$ at high duty. (Superseded on 27 September by
+    the fixed two-stage average below.) \\
+Keep optimising the clock cycles; ADC1 and ADC2 may both sample $v$; use
+multiple agents to verify.
+  & Two rounds of parallel agents searched for savings and three independent
+    agents verified the combination (1190 emulated scenarios on the linked
+    machine code, host tests, independent cycle counts, a silicon review).
+    Result, bit-identical outputs: 166--190 $\to$ 149 core clocks per
+    steady pass, 183--211 $\to$ 154 during the soft-start (the main
+    finding: GCC had optimised the loop for size). Sampling $v$ on both
+    ADCs was evaluated and not adopted: it costs 8--11 clocks per pass and
+    only averages the ADCs' own noise. Also added: NaN-safe PI limits, an
+    earlier arming window, \texttt{make check}, and a boot-time bus
+    benchmark (\code{g_buck.bench}). \\
+Can DMA oversample and average the ADC?
+  & DMA only moves results; averaging would still cost CPU time. The
+    ADC's own oversampling adds the samples in hardware, with no CPU and
+    no DMA; A1 already uses it (4 samples per cycle). \\
+Can ADC3, ADC4 and ADC5 sample $v_{\mathrm{out}}$ 10\,ns apart for extra
+samples?
+  & A0 (PA0) reaches only ADC1 and ADC2. ADC3 and ADC4 would need
+    $v_{\mathrm{out}}$ jumpered to one of their pins (e.g.\ A3 = PB0,
+    PB12); ADC5's pins are the gate outputs. A 10\,ns spacing cannot be set
+    (the trigger is resynchronised to the 56\,MHz ADC clock, about 18\,ns),
+    and samples that close average only the ADCs' own noise. Not adopted. \\
+Option 1: oversample $v_{\mathrm{out}}$ twice per cycle on ADC1.
+  & Two A0 samples per cycle (Timer A CMP4 and CMP3, 357\,ns apart, the
+    second about 100\,ns before the period end), summed by ADC1's
+    triggered $2\times$ oversampling; the loop uses their mean. 357\,ns
+    rather than 268\,ns: RM0440 ignores a trigger that arrives during a
+    conversion (15 ADC clocks); with the ADC and HRTIM clocks locked
+    1:3, 20 clocks always leave 5 idle. Loop code unchanged apart from the scale factor
+    (149 clocks per steady pass). Simulated: per-cycle $\hat{I}$ noise
+    0.26 $\to$ 0.19\,A rms, 0.016 $\to$ 0.012\,A over $N=16$. The DC
+    output is now within 0.4\,mV of $V_{\mathrm{ref}}$ (0.5--1.3\,mV
+    above it before: the single end-of-cycle sample sat 0.7--1.1\,mV
+    below the cycle average of the 3.0--3.6\,mV capacitor ripple).
+    Not yet run on the board.
+    RM0440 Figure~93 also showed that in bulb mode the input is held
+    2.5 ADC clocks (45\,ns) after the trigger, not at it. The Live
+    Expression for $v_{\mathrm{out}}$ is now
+    \code{adc_v_raw*3.3/8192.0}. \\
+Add live denominators for $e_v$ and $\Delta u$ in the trigger score.
+  & $S=(e_v/\code{ev_norm})^2+(\Delta u/\code{du_norm})^2
+    +\rho\,(e_v/\code{ev_norm})(\Delta u/\code{du_norm})$, with
+    \code{tune.ev_norm} in V and \code{tune.du_norm} in A (both $>0$).
+    The defaults, 1\,V and 1\,A, give the specification's score bit for
+    bit. The reciprocals are formed every 64 cycles with the other
+    tunables (one division for both), so no cycle divides; the extra
+    multiplies and registers cost 6--8 clocks per pass (149 $\to$ 155 in
+    steady state). The division on the arming path narrowed the
+    late-arming margin, so \code{BUCK_ARM_LATEST} went from 5120 to 4096
+    ticks (normal arming is at about 2000--2600). Four independent agents
+    checked it: the machine code's score matches the formula to
+    $2\times10^{-7}$ with live $\rho$ and denominators; at the defaults
+    every output is bit-identical to before; 0 or NaN keeps D4 low, a tiny
+    value keeps it high, and the control is never affected. New tests pin
+    the sign and order of $e_v$ and $\Delta u$ and $u[k-1]$ at arming. \\
+Why is $\hat{I}$ on A2 still noisy? Is $N=16$ applied? (5\,mV of
+$\Delta v$ is 0.8\,A, 0.26\,V on A2.)
+  & $N=16$ is applied: checked in the source, in the machine code
+    (emulated DAC writes equal the 16-cycle mean on every pass, from the
+    first pass after arming) and in the flashed image
+    (\code{iload_n} $=16$). The arithmetic is right for $N=1$; at $N=16$
+    the $\Delta v$ term falls by 16, so 5\,mV gives 0.05\,A (17\,mV on A2).
+    Expected: 2.7\,mV rms (about 20\,mV p-p) per LSB of A0 noise at
+    $N=16$, 44\,mV rms at $N=1$. Things $N$ does not remove: the
+    estimate is negative below about 1.1\,A (dead-time bias), so A2 sits
+    at 0\,V; slow content (load changes, $V_{\mathrm{in}}$ ripple at
+    $-1.45$\,A/V); and analog pickup on the A2 probe. Board checks:
+    compare A2 at \code{iload_n} 1 and 16, snapshot \code{out.i_load},
+    measure at 2.5\,A or more (README, \emph{What to expect on A2}).
+    (Superseded: \code{iload_n} was removed later that day; to compare
+    with the per-cycle $\hat{I}$, rebuild with $N_1=N_2=1$.) \\
+Are all $v$ in the calculations the two-sample mean?
+  & Yes: the voltage PI, the estimator's prediction, $\hat{I}$ (both
+    $v[k+1]$ and $v[k]$), $e_v$ and arming all use it; checked in the C
+    code and in the machine code. It lowers uncorrelated ADC noise by
+    $\sqrt{2}$ (0.26 $\to$ 0.19\,A per cycle); noise common to both
+    samples or picked up at a fixed phase is not reduced. \\
+Fault 5 on the board with the two-sample and trigger-denominator build;
+fix it.
+  & Leading suspect (board data not yet read): the 64th pass published
+    the telemetry and re-read the tunables in one pass, with two float
+    divisions and an integer division, about 300--325 core clocks (period
+    280), so the next pass's CMP1 write could miss its deadline; a
+    verifier found a second path, a restart whose first pass was that
+    pass. Fixed: telemetry and tunables in different passes 32 apart,
+    the first of them 24 passes after arming, and the load-window
+    divisions removed. The split itself left D4, A2 and CMP1 unchanged
+    (140\,190 emulated writes; only \code{out.i_load} could differ by up
+    to 2 ulp); that comparison predates the 24-pass start and the
+    two-stage average, which were checked separately (the first telemetry
+    or tunables pass is the 24th after arming for every starting
+    \code{loops}, all $2^{32}$ values). New
+    \code{g_buck.trip_cnt} records the timer at a missed deadline; with
+    \code{loops} mod 64 it identifies the pass. \\
+Try a two-stage load-current average of 32 $\times$ 32 cycles; verify the
+clocks with several agents.
+  & Stage 1 is the previous charge-balance mean over $N_1=32$ cycles,
+    stage 2 the mean of the last $N_2=32$ stage-1 values. A0 noise falls
+    by $N_1\sqrt{N_2}=181$ (16 before); the $\hat{\bar{\imath}}_L$ part
+    only by about 3 in simulation (7 for white noise), and it makes up most
+    of the simulated 0.0023 / 0.0015\,A rms at 1 / 3\,A with $\pm2$ counts
+    (0.012\,A before); a load step
+    reaches 90\,\% after about 100\,$\mu$s (50 before). You chose fixed
+    lengths: a live-tunable pair measured about 8 clocks more in every
+    pass and brought two divisions back; fixed powers of two make the A2
+    code an exact shift. \code{tune.iload_n} is gone
+    (\code{BUCK_ILOAD_N1}, \code{BUCK_ILOAD_N2}, rebuild to change).
+    Ordinary pass 157 $\to$ 167 core clocks, telemetry 213, tunables
+    227--255 plus one VDIV. The deadline check and the CMP1 write are now
+    one asm block, since GCC's register allocation had put a reload of
+    the timer address between them. Three agents verified it (every path
+    walked statically; the linked code emulated over 270\,389 passes and
+    1801 arms, A2 bit-exact, fault 5 never on its own and on every forced
+    late pass; an adversarial review): no firmware error. Their other
+    findings are in Section~\ref{sec:followup28}. (The sizes were changed
+    to 128 $\times$ 128 on 28 September, Section~\ref{sec:followup28}.) \\
+\bottomrule
+\end{xltabular}}
+
+% ============================================================
+\section{Follow-up Requests, 28 September}
+\label{sec:followup28}
+% ============================================================
+
+{\small
+\renewcommand{\arraystretch}{1.25}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}L@{}}
+\caption{Requests and verification findings, 28 September.}
+\label{tab:followup28}\\
+\toprule
+\textbf{Request or finding} & \textbf{Answer and result} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Request or finding} & \textbf{Answer and result} \\
+\midrule
+\endhead
+Make the load estimate faster as $S$ increases: from the 64-cycle
+average down to a 1-cycle average.
+  & Your choices: the two stages while $S\le S_0$; above it one average
+    over $N=64\gg L$ cycles, $L=\lceil\log_2(S/S_0)\rceil$ limited to 6
+    ($N$ halves each time $S$ doubles: 32 up to $2S_0$, \dots, 1 above
+    $32S_0$); $S_0=0.002$, live as \code{tune.iload_s0}. The level follows
+    a rise of $S$ at once and falls by one only after $N$ cycles at the
+    current $N$, so the average never reaches back across a step when $S$
+    peaks some cycles into it (corrected below: not when $S$ peaks in
+    its first cycle). $L$
+    comes exactly from the float bits of $S$ and $S_0$ (no division), and
+    one counter $h$ holds the level ($h=\min(h, 63\gg L_S)+1$,
+    $L=\mathrm{clz}(h)-25$). Cost: 7 clocks per quiet pass (one compare),
+    about 35 more while it runs. On the telemetry and tunables passes it
+    would have pushed those passes to about 283 / 294 clocks (plus the
+    VDIV wait); you chose to skip the update there: A2 keeps its value for
+    that cycle and the level holds. Simulated with $\pm2$ counts: steady
+    state unchanged bit for bit; a 2\,A step reaches 90\,\% on A2 after
+    35\,$\mu$s instead of 102. New Live Expression
+    \code{out.i_load_lvl} (0: the two stages). (Superseded on 28 September
+    by the ladder from 128, last row of this table.) \\
+Verifier: \texttt{make check}'s \code{it cc} rule accepted broken builds
+(trip removed, condition inverted, duty or raw counter compared).
+  & Fixed: the checker follows the data from the counter read through
+    the subtraction to the compare, and follows the \code{bcs} to the
+    fault-5 trip; it tests its own rule at every run. All four broken
+    builds now fail it. \\
+Verifier: every stop overran the ADCs (the 2 $\times$ 64-entry ring
+reset, about 570 clocks, ran in the stop pass) and added 1--2 to
+\code{adc_miss}.
+  & Your choice: the rings are cleared in 8 parts, one per stopped cycle
+    (13\,$\mu$s), and a start waits until they are empty. With the
+    256-entry rings of 128 $\times$ 128 (below): 32 parts of the same
+    8 + 8 words (53\,$\mu$s). \\
+Verifier (all versions): a RUN within about two periods of a STOP, or a
+debugger halt at the wrong moment, could arm in the next period with its
+sample already waiting; the first pass then tripped fault 4.
+  & Your choice: \code{arm()} also requires that ADC1 has not converted
+    again, checked after the counter read (no race; about 3 clocks on the
+    arming path). \\
+Verifier: \texttt{make test} re-implemented the firmware's per-cycle
+load-current sequence instead of running it.
+  & The sequence is one function, \code{buck_iload_cycle()}, which
+    \code{run_pass()} and the closed-loop test both call (same machine
+    code). Mutants of it now fail the tests, as does a broken ring reset
+    (the empty-window test now resets a full window). \\
+Verifier: wrong or stale text.
+  & Corrected: the $\hat{\bar{\imath}}_L$ noise factor, ``the last $N$
+    cycles'', the meaning of \code{loops}, the \code{busy_max} guidance,
+    the quiet-pass count, the sum limit, the counting rule of the clock
+    table (a register-offset store is 2 clocks in the TRM, 1 in the
+    table), and the limit of \code{trip_cnt} (a pass more than a period
+    and 64 clocks late shows as fault 4). \\
+Verifier: the first pass after an arm at the very end of the window has
+little margin with 45 extra wait states per pass.
+  & Refuted by a second agent: the case needs wait states that the
+    board's own \code{busy_max} reading rules out, and a late arm cannot
+    happen on its own. Unchanged. \\
+Make the load-current average 128 $\times$ 128; does it cost CPU?
+  & No extra instructions: the rings hold running totals, so every sum is
+    one subtraction whatever $N$. The linked loop has the same instruction
+    sequence on every path as with 32 $\times$ 32, with equal cycle counts
+    (constants, offsets and some encoding widths differ, plus two padding
+    \code{nop}s that never run; same 4658 bytes; \texttt{make check}
+    passes). The encodings moved the code by $\pm2$ bytes: the first
+    instruction of every steady-state (HOLD) pass no longer starts on a
+    word boundary, which may cost up to 1 clock (6\,ns) per pass; you chose
+    to accept and document it. RAM: the rings grow from 0.5 to 2\,KB (91\,176\,B of
+    96\,KB). Your choices (the ladder was moved below $S_0$ later, last
+    row): the faster averages start at 128
+    ($N=256\gg L$, $L$ limited to 8: 128 up to $2S_0$, \dots, 1 above
+    $128S_0$; the two stages resume 255 counter steps after a 1-cycle
+    average, 263--264 passes with the held telemetry and tunables passes),
+    and the stop clears the rings in 32 parts of 8 + 8 words. A load step
+    now takes 255 cycles (425\,$\mu$s) through the two stages. The sums
+    stay exact for a mean below 20\,A (320\,A before); above it A2
+    wraps. With the default $\alpha_I$ that is out of reach; with
+    $\alpha_I$ of about 0.15 or more and an A1 reading the current loop
+    cannot pull down it can happen (you chose to document it). Simulated
+    with $\pm2$ counts: 0.0014 / 0.0010\,A rms at 1 / 3\,A (0.0023 /
+    0.0015 at 32 $\times$ 32), 1.6 times less for a 3.4 times slower step:
+    the A0 part falls by 1448 from the per-cycle value, but the correlated
+    $\hat{\bar{\imath}}_L$ part, which dominates at both sizes, only by
+    about 1.9 from 32 $\times$ 32. A 2\,A step reaches 50 / 90\,\% on A2
+    after 18 / 40\,$\mu$s (5 / 35 before; highest level $N=8$, 2 before;
+    superseded by the last row).
+    The unused RAM-execution linker script no longer fits (40\,B over
+    already before this change; now 1576\,B). \\
+Verification of the 128 $\times$ 128 change (five agents, each finding
+checked by a second).
+  & No firmware error: every changed constant in the linked code is the
+    value the 128 $\times$ 128 source calls for (so the earlier emulation
+    of the 32 $\times$ 32 build carries over), the level counter was
+    checked for every $h$ and $t$, the stop clear writes every slot
+    once. Found and corrected: the alignment clock above; test gaps (the
+    window test could overflow after a length change on other random
+    seeds, the noise check did not scale with $N$ and failed at 32
+    $\times$ 32 and below, the step bound failed at 16 $\times$ 16 and
+    below, nothing tied the ladder to 128, the stop-clear test missed
+    the last ring slot); and doc errors (the return time, the
+    frequency below which content passes, which noise part dominates,
+    and older rows not marked as superseded). \\
+First board capture of the 128 $\times$ 128 build: why does A2 dip after
+rising on a 1 $\to$ 3\,A step?
+  & In simulation the dip appears when $S$ peaks in the step's first
+    cycle: a $v_\mathrm{out}$ jump across the output capacitor's ESR
+    makes the first-cycle $\Delta v$ large. The level then drops back
+    ($N$ doubles every $N$ cycles), and each doubled average reaches back
+    across the step (about 1\,A with 5\,m$\Omega$ ESR); with the ladder
+    from 128 the last such window slides past the step only after about
+    0.2\,ms. A real capacitance different from the model's 270\,$\mu$F
+    also bends the per-cycle estimate itself during the $v_\mathrm{out}$
+    transient. To tell the two apart on the board: \code{tune.iload_s0 =
+    0} shows the per-cycle estimate on A2 (use scope averaging triggered
+    on the load step), \code{tune.iload_s0 = 1e30} the two stages
+    alone. \\
+Board: with $S_0 = 100$ a smooth rise, with $S_0 = 0.01$ the dip. What
+causes it; would capping $S/S_0$ help?
+  & $S_0$ does not change the estimate, only which average A2 shows, so
+    the dip comes from the ladder: with $S$ only a few times $S_0$ its
+    shortest window is long (64 cycles at $S/S_0\approx 2$), and when it
+    doubles it reaches back across the step (simulated with a clean
+    estimate, the model plant: 0.72\,A at $S_0=0.01$, 0.05\,A at 0.002,
+    none at 100).
+    Capping $S/S_0$ keeps the windows long and does not help; a floor on
+    the window does (8 or 16 cycles: 0.07--0.09\,A at every $S_0$). \\
+Design: normally 128 $\times$ 128; as $S$ approaches $S_0$ the window
+drops to 1.
+  & Your choices: the window shrinks below $S_0$ and reaches 1 cycle
+    once $S$ passes $S_0$ (the ladder moved down by 128: the two stages
+    up to $S_q=S_0/128$, 128 cycles up to $S_0/64$, halving each time $S$
+    doubles, 2 up to $S_0$, 1 above), and $S_0 = 0.128$ (0.002 before),
+    so that steady state stays on the two stages (simulated $S\le 0.001$
+    there). No extra instructions: $S_q$ is folded into the one saturating
+    subtraction, which made the level update 1 clock shorter with the same
+    instructions (a 1-clock immediate move replaced a 2-clock literal
+    load), and the gate compares
+    $\mathrm{bits}(S) < \mathrm{bits}(S_q)+1$. Simulated with $\pm2$
+    counts: steady state on the two stages in every scenario (1.4 /
+    1.0\,mA rms); a 2\,A step goes to a 4-cycle average and reaches 50 /
+    90\,\% after 12 / 35\,$\mu$s. Still possible: a dip when $S$ peaks only
+    just above $S_q$ (a 0.5\,A step falls back by about 0.3\,A, as
+    before) or in the step's first cycle, and an estimate that itself
+    overshoots and falls back if the real capacitance or ESR differ from
+    the model (0.55\,A simulated with 10\,m$\Omega$ and twice the
+    capacitance, with either ladder). This is the earlier ladder with its
+    start at $S_0/128$: $S_0 = 0.256$ is exactly the earlier 0.002. The
+    margin is small: $S_q = 0.001$ is only 2--3\,\% above the simulated
+    peak steady-state $S$ (up to 0.0012 with other noise seeds). On the
+    board, \code{out.i_load_lvl} should read 0 in steady state; if not,
+    raise $S_0$. Verified by four agents, each finding checked by a
+    second: no firmware error; the fast passes are 1 clock shorter; the
+    gate and ladder match your thresholds for all $2^{32}$ values of $S$;
+    a test now drives the gate through \code{buck_iload_cycle()}. (A floor of 1 cycle above $S_0$ was built first and
+    replaced by this at your request.) \\
+\bottomrule
+\end{xltabular}}
+
+% ============================================================
+\section{Follow-up Requests, 24--25 October (BUCK\_Adpt\_Learning)}
+\label{sec:followup1024}
+% ============================================================
+
+{\small
+\renewcommand{\arraystretch}{1.25}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}L@{}}
+\caption{Requests, 24--25 October.}
+\label{tab:followup1024}\\
+\toprule
+\textbf{Request} & \textbf{Answer and result} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Request} & \textbf{Answer and result} \\
+\midrule
+\endhead
+How is $i_\mathrm{avg}$ obtained; does it converge to the measured
+average?
+  & $i_\mathrm{avg}$ (\code{out.i_avg}) is the estimator's corrected
+    value: the Pad\'e model predicts the cycle average from the corrected
+    valley current, the duty, $V_\mathrm{in}$ and $v_\mathrm{out}$, and the
+    measured average (four ADC2 samples per cycle, summed in hardware)
+    corrects it by $\alpha_I = 0.0328$. It settles, but to the measured
+    value only if the model matches the plant: with a model bias about
+    93\,\% of it remains ($A_I\approx0.56$ per cycle, proportional
+    correction only). Simulated with body-diode dead time: measurement
+    within $\pm0.03$\,A, estimate $-1.36$ / $+0.34$\,A off. Not changed. \\
+Copy the code and structure to the new project BUCK\_Adpt\_Learning.
+  & Copied (sources, CMSIS, tests, tools, docs, the custom linker
+    scripts); the Makefile builds \code{BUCK_Adpt_Learning.elf}; after
+    CubeIDE was closed its \code{.cproject}, \code{.settings} and a
+    renamed debug launch were installed (the original's, with the project
+    name replaced). \\
+From the PLECS model: Pad\'e as estimator + correction; the load
+low-pass from averaging to a first-order term damped by the score;
+score with $\rho = 0$ and $\Delta d$ instead of $\Delta i_L$.
+  & The PLECS model already has all three (score
+    $(e/0.02)^2+(\Delta d/2)^2$, $\rho=0$, $S_\mathrm{th}=4$; Adaptive Low
+    Pass with $\tau$ from 33.32\,$\mu$s to 0 at $S\ge S_\mathrm{th}/2$; a
+    3-state predictor/corrector). Your choices: port to the firmware copy;
+    no estimator change now (the firmware's Pad\'e corrects $i_L$ only);
+    the filter with $\alpha$ interpolated (no division per pass):
+    $\alpha = \alpha_0 + (1-\alpha_0)\min(\max(S/(0.5S_\mathrm{th}),0),1)$,
+    $\alpha_0 = T/(\tau_0+T)$, $\tau_0$ live as \code{tune.iload_tau0}
+    (33.32\,$\mu$s); the firmware's scales ($e_v/1$\,V, $\Delta d/1$,
+    $S_\mathrm{th} = 1$). The 128 $\times$ 128 average, its ladder, the
+    rings and the stop-time clearing are gone. The coefficients take one
+    division, in the stopped cycles and in the telemetry pass (not the
+    tunables pass, the longest). Static count (one model for both):
+    normal pass 156 / 169 / 161 / 169 clocks against 167--209 before,
+    telemetry 243--260 (219--247; 220--248 with the dependent-load rule
+    added on 25 October), tunables 232--264 (240--268); each 28 September
+    figure is 1 clock more if a load right after a register-offset store
+    is not counted as pipelined, as the TRM has it (open); RAM
+    $-2$\,KB. Simulated with $\pm2$ counts: A2 noise 6.6 / 6.3\,mA rms
+    (1.4 / 1.0 with 128 $\times$ 128); a 2\,A step reaches 50 / 90\,\%
+    after 27 / 60\,$\mu$s (35 / 103 with $\alpha$ fixed); with
+    $S_\mathrm{th} = 1$ the step's score (about 0.04) lifts $\alpha$ only
+    to 0.13. Host tests rewritten for the filter and $\Delta d$; all
+    pass. Not run on the board. \\
+Verification of the 24 October changes (four agents, each finding
+checked by a second).
+  & The filter arithmetic holds for every input (coefficients finite for
+    all $\tau_0$, $S_\mathrm{th}$; $\alpha$ in its range for every $S$),
+    and the clock figures were reproduced. Fixed: the coefficients were
+    zero, and $\alpha$ therefore 0, for the first 24--56 passes when
+    \code{command} was set before the warm-up ended (e.g.\ at the
+    \code{main} breakpoint), and a halt's tunables were skipped at the
+    start: they are now formed at boot and in every stopped cycle that
+    does not start the run. Two test gaps (the score's $d$ against the
+    CMP1 duty; the duty at arming computed independently) and several
+    comments and figures. Left for you: A2 starts near 0\,A after arming
+    (the gates were off) and rises with $\tau_0$, about 100\,$\mu$s;
+    whether PLECS's $\Delta d$ at a rise is this update's or the
+    previous one (not confirmed); the README lists the other differences
+    to PLECS. \\
+How to set $\tau$?
+  & Write \code{g_buck.tune.iload_tau0} in seconds (Live Expressions
+    row; default 33.32e-6). While running it takes effect within about
+    96 cycles (160\,$\mu$s); 0 means no filtering ($\alpha = 1$), values
+    above 1\,s count as 1\,s. \\
+An additional averaging filter on the load estimate, 32 samples; then
+``remove the 32 avg''.
+  & Built as asked (before the first-order filter, always on: a ring of
+    the last 32 estimates and their exact running sum). Measured: 12--13
+    clocks in every pass, the longest pass 276 of 280 clocks (280 with
+    the loop head); simulated A2 noise 2.1 / 1.4\,mA rms instead of 6.6 /
+    6.3, a 2\,A step at 90\,\% after 98 instead of 60\,$\mu$s. Removed at
+    your request before it was verified or run: the code, tests and
+    README are back to the filter alone; the rebuilt control loop is
+    identical, instruction for instruction, to the build before the
+    average (4482\,B), and the host tests pass. \\
+25 October: ``change the score function to $a u^2 + b u^2 + c$, or any
+other suggestion; I need it to increase quadratically in a transient'',
+and a minimum of 3.3\,$\mu$s for the low-pass filter coefficient.
+  & Your decisions: $S = a e_v^2 + b e_v + c$, $e_v = v_\mathrm{out} -
+    V_\mathrm{ref}$ (signed, as before); $a$, $b$, $c$ live as
+    \code{tune.score_a}, \code{tune.score_b}, \code{tune.score_c},
+    defaults 1, 0, 0 ($S = e_v^2$, bit for bit); $\rho$, \code{ev_norm},
+    \code{du_norm} and the $\Delta d$ term removed, with the previous duty
+    (\code{st.d}) that only $\Delta d$ used. The one $S$ drives D4
+    ($S \ge S_\mathrm{th}$) and the filter. It is evaluated as
+    $(a e_v + b) e_v + c$: two multiplies, two adds, no division, within
+    4 roundings of the formula. With $a < 0$, $b \ne 0$ or $c < 0$, $S$ can be
+    negative: then $\alpha = \alpha_0$, and D4 stays low while
+    $S_\mathrm{th} > S$; a NaN $S$ gives $\alpha_0$ and D4 low, $+\infty$
+    gives $\alpha = 1$ and D4 high. Static count, HOLD / FREE\_UP / UP /
+    DOWN, with a load whose address comes from the load just before it
+    counted as not pipelined (Cortex-M4 TRM; the HOLD and FREE\_UP copies
+    each have two such loads, the 24 October loop none): normal pass
+    150 / 154 / 160 / 160 clocks (156 / 161 / 169 / 169), telemetry
+    239--253 (243--260), tunables 211--243 (232--264: the VDIV is gone),
+    the CMP1 write 74 / 74 / 76 / 76 clocks into the pass (77); the first
+    pass after arming 310--336 of its 416 clocks (334--357 as counted on
+    24 October, 334--356 by the same count), and
+    \code{BUCK_ARM_LATEST} stays at 4096 ticks (about 80 clocks of margin,
+    60 before). Counting those loads as pipelined, as first reported,
+    gave 149 / 153 / 160 / 160, 237--253, 210--243, 73 / 73 / 76 / 76
+    and 309--336. With the TRM rule two other orders of the four copies
+    are no worse in any pass length or the CMP1 write and better in most
+    (README); the order is unchanged until you decide. With the default
+    coefficients every simulated A2 figure is unchanged; only the steady-state peak $S$ changed (no
+    $\Delta d$ term). New tests: the formula against double over 2 million
+    random $a, b, c, e_v$; NaN, $\pm\infty$ and negative scores; closed
+    loops with $a = 100$, and with $a, b, c = 100, 5, -0.25$ ($S = -0.25$
+    at rest, D4 only on the overshoot of the step down); with the default
+    score and filter, $\alpha$ below 0.1 on average and A2 noise below
+    10\,mA rms. \texttt{make check} now also requires every tunable to be
+    read at the loop entry and in the tunables pass (it fails when the
+    tunables pass stops copying $a$, $b$, $c$, or the telemetry pass stops
+    forming the filter coefficients); the rest of the wiring in
+    \texttt{buck.c} (e.g.\ which value feeds the filter as $S$, or which
+    value drives D4) is checked by review only. \\
+``Don't cap it; use different $S_\mathrm{th}$ for score and filtering.''
+  & The 3.3\,$\mu$s minimum $\tau$ was considered (it would have capped
+    $\alpha$ at $T/(3.3\,\mu\mathrm{s}+T) = 0.336$) and dropped: $\alpha$
+    still reaches 1 at $S \ge S_f$ (at $S = S_f$ exactly, float rounding
+    can leave it up to $2.4\times10^{-7}$ below 1). The filter has its own
+    live threshold \code{tune.iload_s_th}, $S_f = 0.5\,$\code{iload_s_th}, default 1 (the
+    $S_\mathrm{th}$ default, so A2 is unchanged until it is tuned), with the
+    clamping and NaN rules $S_\mathrm{th}$ had there; \code{tune.s_th} sets
+    D4 only. Tests: D4 and the filter each follow their own threshold, bit
+    for bit unchanged when the other one moves; closed loop with
+    \code{iload_s_th} $= 0.01$: $\alpha = 1$ on the steps, A2 at 90\,\%
+    after 8\,$\mu$s, D4 low. Live Expressions: \code{tune.rho},
+    \code{tune.ev_norm}, \code{tune.du_norm} replaced by
+    \code{tune.score_a}, \code{_b}, \code{_c} and \code{tune.iload_s_th}
+    (42 rows). Not run on the board. \\
+\bottomrule
+\end{xltabular}}
+
+% ============================================================
+\section{Follow-up Requests, 25 October (Buck\_disturb\_obs)}
+\label{sec:followup1025obs}
+% ============================================================
+
+You asked for your fixed-gain load-current observer, studied it against
+the score-damped filter of BUCK\_Adpt\_Learning, and decided how it goes
+into a new copy, Buck\_disturb\_obs. The study's numbers come from a
+closed-loop host simulation (the same plant as \texttt{make test}, the
+firmware's own per-cycle code); those marked ``this build'' are from the
+code as delivered. Nothing has run on the board.
+
+{\small
+\renewcommand{\arraystretch}{1.25}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}L@{}}
+\caption{Requests and decisions, 25 October (Buck\_disturb\_obs).}
+\label{tab:followup1025obs}\\
+\toprule
+\textbf{Request or decision} & \textbf{Answer and result} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Request or decision} & \textbf{Answer and result} \\
+\midrule
+\endhead
+Your observer: $e = v_\mathrm{out} - \hat v$,
+$\hat v \leftarrow \hat v + a(i_L - \hat I) + \beta e$,
+$\hat I \leftarrow \hat I - \gamma e$; compare it with today's filter.
+  & Study (two simulations, each rebuilt by a second agent). In
+    predict-then-correct order (PC) the observer is exactly two identical
+    first-order stages $y \leftarrow y + (1-p)(\hat I_k - y)$ on the
+    per-cycle estimate $\hat I_k = i_L - (C/T)(v_{k+1} - v_k)$, transfer
+    function $(1-p)^2/(1-pz^{-1})^2$, for $\beta = 1-p^2$ and
+    $a\gamma = (1-p)^2$, $a = T/C$. It has the input's DC value, so fed
+    $\hat{\bar\imath}_L$ it keeps the dead-time bias ($-1.36$ / $+0.34$\,A
+    at 1 / 3\,A with body diodes); fed the measured average $i_\mathrm{meas}$
+    the bias is $+0.027$ / $-0.018$\,A. At $\tau = 9.2\,\mu$s (fed
+    $\hat{\bar\imath}_L$) it matched the filter's body-diode step (90\,\%
+    after 60.0 / 73.3\,$\mu$s) with 5.09 instead of 6.40\,mA rms of A2
+    noise; fed $i_\mathrm{meas}$ the noise is 14--15\,\% higher. A prototype
+    with live gains was 8--13 clocks shorter per normal pass than the filter
+    (on the code before the score change). \\
+1.\ Base: BUCK\_Adpt\_Learning after the score change and the ``fix
+base'' stage; the score keeps driving D4.
+  & Copied as such. $S = a e_v^2 + b e_v + c$ (\code{tune.score_a},
+    \code{_b}, \code{_c}, defaults 1, 0, 0) drives D4 ($g = S \ge
+    S_\mathrm{th}$) and nothing else: with the filter gone it no longer
+    touches A2. \\
+2.\ The load estimate on A2 and \code{out.i_load} from your observer,
+predict then correct, $a = T/C$, $v$ = this pass's two-sample mean, $i_L$
+= the raw 4-sample ADC2 mean of the cycle, after the guarded CMP1 write;
+A2 code as before.
+  & Done: \code{buck_iload_obs()} in \code{run_pass()} after
+    \code{buck_ctrl_slow_k()} (so after the CMP1 write), fed
+    \code{st.v} and \code{st.im} of the pass's \code{buck_step_t};
+    A2 $=$ \code{buck_iload_dac(}$\hat I$\code{)}.
+    $a = $ \code{BUCK_OBS_A} $= (T/C)$ as float $= 1/162$\,V/A. It replaces
+    the per-cycle $\hat I$ (\code{buck_load_estimate}) and the filter; the
+    controller state's previous $v_\mathrm{out}$ (\code{buck_state_t.v},
+    i.e.\ \code{g_buck.st.v}), used only by $\hat I$, went with it. \\
+3.\ Live gains \code{tune.obs_beta}, \code{tune.obs_gamma}; defaults
+from a double pole at $\tau = 9.2\,\mu$s.
+  & $p = e^{-T/\tau} = 0.83430$, $\beta = 1 - p^2 = 0.3039396$,
+    $\gamma = (1-p)^2 C/T = 4.447826$\,A/V ($4.4478256$; the float is
+    $4.4478254$; the request's 4.447825 is truncated), formed at compile time from
+    $\tau$ (\code{BUCK_OBS_TAU_S}) with the 7-term series already used for
+    $\alpha_I$ (relative error $1.7\times10^{-10}$); the floats are the same
+    bits as with libm's \texttt{exp} (checked by \texttt{make test} from
+    $\tau = 9.2\,\mu$s written in the test, and against the digits). \\
+4.\ A NaN or out-of-range pair rejected where the gains are reloaded
+(tunables pass, loop entry), previous values kept, the compiled defaults
+at the entry; out of range $=$ outside the stable region, derived by Jury,
+closed boundary rejected.
+  & Error dynamics $x_1' = (1-\beta)(x_1 - a x_2)$,
+    $x_2' = \gamma x_1 + (1 - a\gamma) x_2$ (the same matrix moves the
+    observer's own state), $P(z) = z^2 - (2 - \beta - a\gamma) z + (1-\beta)$.
+    Jury: $a\gamma > 0$, $4 - 2\beta - a\gamma > 0$, $|1-\beta| < 1$, i.e.\
+    $\gamma > 0$ and $0 < \beta < 2 - a\gamma/2$. No further condition: the
+    study's extra $1 - a\gamma > -1$ is not needed ($a\gamma = 3$,
+    $\beta = 0.25$: both poles at $|z| = 0.866$). The pair is judged as a
+    pair; at the entry a rejected pair gives the defaults, in the tunables
+    pass the gains in use stay. The test is exact in float for every pair
+    (\code{buck_obs_gains_ok}: the rounding error of $a\gamma/2$ by Dekker's
+    product, no FMA); a plain float test would accept 32 of the 80 points
+    exactly on the boundary that \texttt{make test} constructs. Cost (this
+    build): 28--38 clocks in the tunables pass, 24--34 on the arming path. \\
+5.\ No NaN guard on the observer states.
+  & None. \\
+6.\ Remove \code{tune.iload_tau0}, \code{tune.iload_s_th},
+\code{out.i_load_alpha} and what served only the filter; adjust rule 4 of
+\texttt{make check}.
+  & Removed, with \code{buck_lpf_k_t}, \code{buck_iload_lpf_k},
+    \code{buck_iload_alpha}, \code{buck_iload_lpf}, the VDIV in the
+    telemetry pass and the stopped loop, the \code{BUCK_ILOAD_*} constants,
+    the filter's tests and the closed-loop $\alpha$ bounds. Rule 4 now
+    requires each tunable to be read at the loop entry \emph{and} in the
+    passes, counted separately (until now: two reads anywhere). Reason: GCC
+    repeats the gains' check in all four copies of the tunables pass, so an
+    entry taking the defaults without reading the tunables still had four
+    reads and passed; it now fails, as does a tunables pass without the
+    gains' reload. It also requires \code{obs_beta} and \code{obs_gamma}
+    among the fields, and (repair after the verification) that they are not
+    read on the path of an ordinary pass (from a pass head, without the
+    branch of the \texttt{loops \& 31} test), so the reload line moved into
+    every pass fails it too. A check run every pass on the loop's own copy
+    \code{c->t} reads nothing from \code{g_buck} there and passes (review
+    only). \\
+7.\ Seeding: at the loop entry $\hat I$ = the arming pass's
+$i_\mathrm{meas}$, $\hat v$ = its $v$.
+  & \code{buck_obs_seed(&b->out)} at the entry (arming publishes
+    \code{out.i_load} $= i_\mathrm{meas}$ as before). \\
+8.\ Project setup: copy BUCK\_Adpt\_Learning's code and structure into the
+new empty project as on 24 October; prepare \code{.cproject},
+\code{.settings} and the debug launch for installation after CubeIDE is
+closed.
+  & Copied: \code{Inc}, \code{Src} (the template's \code{main.c} replaced;
+    \code{syscalls.c}, \code{sysmem.c} and the startup file were identical),
+    \code{Startup}, \code{Drivers}, \code{Tests}, \code{tools}, \code{docs},
+    \code{README.md}, the Makefile (\code{NAME := Buck_disturb_obs}),
+    \code{.gitignore} and the custom linker scripts (over the template's:
+    RAM 96\,K instead of 128\,K, and the \code{.ccmtext} output section).
+    The project's \code{.project} kept; \code{.cproject} and \code{.settings}
+    untouched. Prepared outside the project: BUCK\_Adpt\_Learning's
+    \code{.cproject}, \code{.settings} and debug launch with the project name
+    replaced (launch renamed), with diffs against the template. Not yet
+    installed. Before any change the copy built to the same binary as
+    BUCK\_Adpt\_Learning. \\
+9.\ BUCK\_Adpt\_Learning stays as it is; the projects are independent.
+  & Not modified by this stage. \\
+Results (this build).
+  & \texttt{make}: 0 warnings, RAM 89\,112\,B, FLASH 8504\,B;
+    \texttt{make check} ok; \texttt{make test} 0 failures. Static count
+    (HOLD / FREE\_UP / UP / DOWN; a load whose address comes from the load
+    before it as 2 clocks), against BUCK\_Adpt\_Learning: normal pass 140 /
+    142 / 148 / 148 (150 / 154 / 160 / 160); telemetry 180 / 182 / 190 /
+    188 (up to 253: no VDIV now); tunables 237--267 (211--243: the gains'
+    check); CMP1 write 73--75 clocks into the pass (74--76); first pass
+    after arming 337--368 of 416 (310--336). Longest pass 267 of 280 (the
+    tunables pass). No order of the four copies is at least as good on
+    every measure; UP, FREE\_UP, DOWN, HOLD is better on the limiting
+    figures (longest pass 265, arming 336--367, the CMP1 write 1 clock
+    earlier in every copy) and 2 clocks longer on DOWN's telemetry pass
+    (190 against 188); DOWN, FREE\_UP, UP, HOLD likewise, with arming
+    335--366 and UP's tunables pass 265 (262). Averaged over 64 passes in steady state (HOLD): 142.3
+    clocks (152.4). Simulated with $\pm2$ counts of ADC noise: A2 noise 5.7
+    / 5.7\,mA rms at 1 / 3\,A (bound 8\,mA), bias $+0.024$ / $-0.020$\,A
+    ($+0.027$ / $-0.018$ without noise, $-0.015$ / $-0.017$ with ideal dead
+    time; bound 0.05\,A); a 2\,A step at 50 / 90\,\% after 15.0 / 88.3\,$\mu$s
+    up and 13.3 / 41.7\,$\mu$s down (body diodes); the observer within
+    $5\times10^{-6}$\,A of the two first-order stages. On the study's
+    2\,kHz 1--3\,A square profile (its harness, not a host test) A2's rms
+    error is 380\,mA with body diodes and with ideal dead time, against 1087
+    and 445\,mA for BUCK\_Adpt\_Learning's filter. Mutants: the observer
+    in the other order, $\gamma$'s sign, the check without its rounding
+    error, accepting the boundary, without $\gamma > 0$ or $\beta > 0$, the
+    reload not keeping the previous gains, a wrong seed, default $\gamma$ or
+    $a$, $\tau$ = 9.3 or 10\,$\mu$s: each fails \texttt{make test}; the
+    reload or the entry check removed from \code{buck.c}, or the reload
+    line moved into every pass: each fails \texttt{make check}. Still
+    review only (each passes \texttt{make}, \texttt{make check} and
+    \texttt{make test}), for example: the check run every pass on
+    \code{c->t}, or in the telemetry pass; the observer stepped only in the
+    tunables pass, or twice per pass; $\hat I$ seeded from
+    \code{out.i_avg}; the observer fed $\hat{\bar\imath}_L$ or $V_\mathrm{ref}$,
+    or moved before the CMP1 write; the check's result ignored; $\hat v$
+    started at 0 in \code{run_loop}; A2 written from $\hat v$;
+    \code{out.i_load} not updated in the telemetry pass (an uninitialised
+    value published, no warning) or published as $\hat v$ or
+    $i_\mathrm{meas}$; the entry falling back to 0 instead of the defaults;
+    the reload checking the previous tunables' pair. \\
+Left for you.
+  & Decided by you after the report (25 October), all kept as built: the
+    exact check stays at the loop entry (arming margin 48 clocks instead of
+    80); no telemetry of the gains in use after a rejected write; the copy
+    order UP, FREE\_UP, HOLD, DOWN; the wiring mistakes above stay review
+    only, without further \texttt{make check} rules. Still open: with ESR the model misses $162 \times$ ESR of the
+    capacitor current (5\,m$\Omega$: the step down at 90\,\% after 130
+    instead of 42\,$\mu$s). The 2\,kHz profile is not among the host
+    tests. The 28 September column of the clock table counts a
+    load right after a register-offset store (and, for arming, after an
+    STRD) as pipelined, against the TRM: restate it (+1 clock per figure)
+    or keep it with the note. Until the prepared settings are installed, a
+    CubeIDE build of this project fails (no CMSIS include paths). \\
+\bottomrule
+\end{xltabular}}
+
+% ============================================================
+\section{Follow-up Requests, 25 October evening (Buck\_disturb\_obs: fault 5 on the board)}
+\label{sec:followup1025f}
+% ============================================================
+
+The first board run of Buck\_disturb\_obs (CubeIDE Debug build, the same
+CCM code as the Makefile build) tripped fault~5 on the first pass after
+arming. You had the cause analysed, chose option~(f) ``setup before
+arming'' and asked for timing stamps. Clock figures are counted on the
+linked ELF from the issue of one instruction to the issue of another,
+static (your model) and with the wait states of the boot benchmark
+\code{g_buck.bench} (nominal, and pessimistic with CCM literals at
+$+2$ and no decay of the write penalties). Nothing of the fix had run on
+the board when this section was written; it ran on 27 October (you
+reported that it works; no data were read). Its clock figures are
+superseded by the 28 October build (Section~\ref{sec:followup1028}).
+
+{\small
+\renewcommand{\arraystretch}{1.25}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}L@{}}
+\caption{Requests and decisions, 25 October evening (the fault~5 fix).}
+\label{tab:followup1025f}\\
+\toprule
+\textbf{Request or decision} & \textbf{Answer and result} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Request or decision} & \textbf{Answer and result} \\
+\midrule
+\endhead
+Board result (25 October, about 21:12).
+  & Fault~5 on the first pass after arming: \code{loops} $= 8$ (its start
+    value), \code{trip_cnt} $= 8608$ ticks against the deadline 8448
+    (5~clocks late), $v_\mathrm{out}$ 0\,V, \code{adc_miss}, \code{warmup}
+    and \code{busy_max} 0. \code{bench} (extra clocks per access over
+    SRAM1): CCM literal or data load while executing from CCM $+1.06$;
+    HRTIM counter read $+3$; ADC12\_CSR, ADC1\_DR, ADC2\_DR reads $+1$;
+    DWT\_CYCCNT 0; a peripheral write followed at once by an SRAM or
+    peripheral load $+2$ (by a CCM literal $+1$); back-to-back CMP1
+    writes $+1.06$; DAC and BSRR about 0. \\
+Analysis.
+  & The static count had no wait states. With them the old path from
+    \code{arm()}'s counter read to the first pass's guarded counter read
+    was 334--365 static, 375--408 nominal, 405--440 pessimistic (the
+    board's: 361 / 402 / 432; 30--32 CCM literal loads). The deadline is
+    absolute (one period plus 264 clocks after the start of the arming
+    period), and the trip means about 460--485 clocks at the usual arming
+    point: 60--80 clocks (16--20\,\%) that the model does not explain.
+    Hypothesis, unproven: VLDR/VSTR at 2~clocks, not pipelined ($+63$ on
+    that path). Steady state keeps 100--150 clocks of CMP1 margin. \\
+1.\ Fix (f), in Buck\_disturb\_obs only: \code{buck_run} calls
+\code{run_loop} in the stopped cycle that sees RUN; the entry runs
+there; then the loop waits for the next sample and arms with today's
+conditions; a refused arm waits; a bad sample or a STOP leaves as
+today; every stopped-loop duty that still applies is kept; arming with
+the tunables copied at the entry is accepted.
+  & Done. \code{buck_run} calls \code{run_loop(b)} where it called
+    \code{arm()} (no bad sample, \code{warmup} 0, \code{state} STOPPED,
+    \code{command} RUN). The entry (prologue, the exact gains' check as its
+    first statement, \code{c.t}, Ki$\cdot$T, score coefficients, target,
+    step, ADC base, \code{loops}) ends with an empty \code{asm volatile}
+    taking those values as inputs, with a memory clobber: in the ELF the
+    entry ends at 0x100004e2, before the wait's first status read at
+    0x100004e6, with every tunable read and Ki$\cdot$T, the target and
+    \code{loops} formed; nothing of it after the wait (without the
+    \code{asm} GCC moves Ki$\cdot$T, the target and \code{loops} there:
+    17~clocks more). Per waiting sample, as the stopped loop: the status
+    wait with its 840-poll timeout (fault~4), the two DR reads, the raw
+    codes published; a bad sample clears the overrun flags, counts in
+    \code{adc_miss} and returns (still stopped); a STOP returns. The
+    warm-up count and the state test do not apply (the call requires
+    \code{warmup} 0 and STOPPED, and nothing changes them before the
+    arming). Arming: CYCCNT and the counter read in one \code{asm}, the
+    window 897--4095, then the ADC1 re-check (read after the counter);
+    \code{buck_ctrl_arm} on the loop's \code{c.t} and \code{c.s};
+    CMP1, then OENR; \code{state} $=1$; \code{out.*} published; the
+    observer seeded from the arming sample; then the first pass.
+    \code{g_buck.st} is written back at a stop or trip as before, no
+    longer at arming (during a run it holds the previous stop's state).
+    BUCK\_Adpt\_Learning and Buck\_Current\_Mode untouched. \\
+2.\ Keep: the exact check literally at the entry and in the tunables
+pass (defaults at the entry); the seeding; predict then correct;
+$i_\mathrm{meas}$; $\tau = 9.2\,\mu$s; no NaN guard; the score and D4;
+the copy order UP, FREE\_UP, HOLD, DOWN; \code{BUCK_ARM_LATEST} 4096;
+fault~5 for any late CMP1 write, the first pass's included.
+  & All kept; no line of code in \code{Inc/buck_ctrl.h} changed (two
+    comments), and \texttt{make test} prints the same output, line for
+    line, as the build before the fix. The first pass's CMP1 write has the
+    same guarded check and trip as every other. \\
+3.\ Timing stamps appended after \code{trip_cnt} (existing offsets
+unchanged); per-pass code of the ordinary passes unchanged; stamp work
+off the critical path; how to read them; Live Expressions rows checked
+with gdb.
+  & \code{arm_cnt}, \code{arm_cyc}, \code{first_cnt}, \code{first_cyc},
+    \code{trip_cyc} at offsets 228--244 (\code{g_buck} 248\,B, at
+    0x20000000 as before). Each CYCCNT is read by the instruction just
+    before its counter read (both pairs in one \code{asm}), so
+    $\mathtt{first\_cyc} - \mathtt{arm\_cyc}$ equals
+    $(\mathtt{first\_cnt} + n \cdot 8960 - \mathtt{arm\_cnt})/32$ within a
+    clock or so, $n$ being the period starts between the two reads: $n = 1$
+    when the check falls in the period after arming, as it normally does.
+    Only then is $8448 - \mathtt{first\_cnt}$ the first write's margin;
+    \code{first_cnt} below 2048 means the check came more than a period
+    late (fault~5), and that row then reads 6401--8448 (8448 also before
+    the first start, with \code{first_cnt} 0). The first pass is a
+    fifth copy of the pass (its reference step chosen at run time); it
+    alone reads the stamp CYCCNT and stores the four stamps after its CMP1
+    write (on its trip or on a stop before its check too;
+    \code{0xFFFFFFFF} in \code{first_*} for the latter, where
+    $\mathtt{first\_cyc} - \mathtt{arm\_cyc}$ means nothing), but not when
+    it ends in \code{buck_fatal()} (fault~4 by the sample timeout, or
+    fault~8): the stamps then keep the previous start's values. 0 until the
+    first start. \code{trip_cyc}: CYCCNT read at the start of the trip
+    branch of every pass (its first instruction in the first pass; in the
+    ordinary copies after two register moves and a stack load, and in three
+    of them a branch), 11--16 clocks after the counter read in
+    \code{trip_cnt}; 0 until a fault~5. The four ordinary copies contain
+    no stamp code, but they are not instruction-identical to the build
+    before (item~4). Live Expressions: seven rows
+    added (the five stamps, \code{first_cyc-arm_cyc} and
+    \code{8448-(int)first_cnt}), 48 in all, each evaluated with
+    \texttt{arm-none-eabi-gdb} against the ELF. \\
+4.\ Counts from the linked ELF; 280 clocks per pass; CMP1 by 264
+clocks into the period.
+  & Arming check to the first pass's guarded counter read (first pass
+    starting late): 172--195 static, 196--221 nominal, 213--240
+    pessimistic (before 334--365 / 375--408 / 405--440); the board's path
+    195 / 221 / 240 (before 361 / 402 / 432), estimated 231--266 on the
+    board (VLDR/VSTR at 2~clocks: 236; flat 16--20\,\%: 257--265; up to
+    about 306 if the old excess, 56--85 clocks over the nominal count, is
+    one fixed cost that falls on this path too). Against 416 at the latest
+    arming point (4096 ticks) that leaves the arming path 176--220 clocks
+    of slack (about 150 with the board's excess as a proportion, 110 or
+    more as a fixed cost), which is not the first write's margin: the
+    first pass's head comes 94--117 / 108--133 / 118--145 clocks after the
+    arming check, at most 273 clocks into the arming period, before the
+    next end of conversion (about 313), so at every accepted arming point,
+    4096 included, it waits for its sample and checks at 120--138 clocks
+    into the next period: 126--144 clocks of margin (about 108--130 with
+    the board's excess). The arming CMP1 write (no deadline check by
+    design, so no fault~5) is the tighter limit on
+    \code{BUCK_ARM_LATEST}: 77--88 / 91--103 / 99--112 clocks after the
+    arming check's counter read (\code{arm()}: 83--90 / 99--107 /
+    109--118), so at 4096 it lands 24--37 clocks before 264 (pessimistic;
+    about 13--31 with the board's excess as a proportion, past 264 if that
+    excess were a fixed cost there); a late arming write leaves the first
+    enabled period at the previous CMP1 (\code{BUCK_CMP_MIN}). GCC stores
+    10 of the 11 \code{out.*} fields before that write (\code{arm()}
+    stored 10 of them after OENR and \code{out.g} between CMP1 and OENR;
+    with a memory barrier after OENR the write comes 6--7 clocks earlier,
+    counted, not kept). The stamps' CYCCNT
+    reads: the arming one moves the arming counter read 6--10 clocks later
+    after its sample, not the write relative to that read; the first
+    pass's costs 1~clock on its \code{strcc}. The first pass as a whole
+    (body to the next copy's status read, that read included, as for the
+    passes below): 193--217 static, 221--246 nominal, 240--266
+    pessimistic; to HOLD 193--205, FREE\_UP 202--214, UP 201--217, DOWN
+    195--207 static (191--215 / 218--243 / 237--263 without that read).
+    It is the longest pass type after the tunables pass; with its poll
+    head about 250 nominal, so with the board's 16--20\,\% it can run up
+    to about 20 clocks past 280. That only delays the second pass (by up
+    to about 20 clocks after its sample), whose CMP1 write still lands
+    about 90--120 clocks before 264; nothing accumulates (a normal pass is
+    about 150). The stopped cycle
+    that sees RUN reaches the arming wait at most 210 clocks into the
+    period (pessimistic), before the next end of conversion (about 313).
+    Ordinary passes, static (before $\to$ now, HOLD / FREE\_UP / UP /
+    DOWN): normal 140 / 142 / 148 / 148 $\to$ 140 / 143 / 147 / 147;
+    telemetry 180 / 182 / 190 / 188 $\to$ 182 / 185 / 189 / 189;
+    tunables at their longest 262 / 264 / 262 / 267 $\to$ 262 / 259 /
+    267 / 264; CMP1 74 / 73 / 75 / 75 $\to$ 72 / 72 / 73 / 73;
+    \code{busy_max} window 141 / 143 / 151 / 149 $\to$ 143 / 146 / 150 /
+    150. Longest pass 267 (294 nominal, 309 pessimistic with the head),
+    as before. The ordinary copies' normal passes keep their instruction
+    count (131 / 133 / 138 / 138, head to loop-back) with other registers
+    and stack slots, but are not the same instructions:
+    \texttt{lsls~\#27} for \texttt{tst~\#31} in all four; in FREE\_UP
+    the ADC2 code is the value spilled (the ADC1 code before) and is
+    reloaded with \texttt{vldr} where \texttt{vmov} moved it, before the
+    CMP1 write, a value held in \texttt{s31} before is reloaded from the
+    stack after it, and one 16-bit \texttt{ldr} is 32-bit; instructions in
+    another place: HOLD 7, UP 3, DOWN 3, FREE\_UP 11 (longest common
+    subsequence, registers and stack slots abstracted). FREE\_UP's CMP1
+    write is 1~clock earlier and its pass 1~clock longer. \code{run_loop} 4308\,B $+$ \code{arm()} 432\,B $\to$
+    5620\,B; RAM 89\,112\,B unchanged; FLASH 8504 $\to$ 9396\,B. \\
+\texttt{make check}.
+  & Kept every rule. The arming CMP1 write, now inside \code{run_loop},
+    is exempt from the deadline guard, and only it: the one CMP1 write
+    followed within three instructions by the OENR write through the same
+    base, not on the path of an ordinary pass. A literal pool between the
+    \code{strcc} and its \code{bcs} (\code{b}, then \code{bcs}: GCC does
+    this in the first pass) is accepted, nothing else. The entry of the
+    tunables rule still ends at the first ADC12\_CSR read, which is now the
+    arming wait's, found by tracking the entry's register values (GCC
+    reads it through \code{ip}); so ``read at the loop entry'' means read
+    before the arming wait. Each change is self-tested. On 26 October 13
+    of 21 broken versions of these changes still passed the self-tests:
+    two that cannot behave differently on \code{run_loop}, and the join
+    with the paths in the other order; a sub, an mvn, a movt or a literal
+    load; a register write or a call not making a register unknown; the
+    entry continued past a call that does not return; two arming writes;
+    one on the path of an ordinary pass; a branch between CMP1 and OENR.
+    Cases for the eleven were added; of five more broken versions, three
+    (a register copy not tracked right) passed those too, and cases for
+    them were added. Also on 26 October: the exemption of stores to
+    offset 156 through a register holding \code{g_buck}'s address (a
+    \code{g_buck} field, not CMP1) no longer breaks when that register is
+    written with a value never used as an address (every path from the
+    write returns, branches out or calls \code{buck_fatal()} first). GCC
+    used the register as a scratch on such a block when a bad sample
+    while waiting is not counted; \texttt{make check} then reported its
+    stores to \code{busy_max}, at CMP1's offset, as unguarded CMP1 writes
+    and found no register holding \code{g_buck}'s address for the
+    tunables rule. Self-tested: of 24 broken versions of this change, 16
+    passed the first eight cases (12 accepting more, 4 rejecting more),
+    and cases for them were added. Every broken version, 50 in all, now
+    fails the self-tests except the two that cannot behave differently.
+    A rule that the
+    arming write is window-checked was considered and not added (it needs
+    the counter read and both tests located on every path to the write). \\
+Results (this build).
+  & \texttt{make}: 0 warnings; \texttt{make check} ok; \texttt{make test}
+    0 failures, output identical to the build before the fix. Mutants:
+    caught by \texttt{make check}: CMP1 after OENR, no OENR, the first
+    pass's write unguarded, its CYCCNT read after the \code{strcc}, the
+    gains' check, the tunables' copy or the score coefficients after the
+    wait; review only (pass all three checks): arming without the window,
+    without the ADC1 re-check, with 5120, or with the window's upper bound
+    off by one; a refused arm that does not retry (the window's or the
+    ADC1 re-check's refusal ending the wait); \code{buck_ctrl_arm} on
+    \code{g_buck.tune} instead of \code{c.t}; the entry's \code{asm}
+    removed or Ki$\cdot$T after the wait (only the clock count shows it);
+    a bad sample while waiting not counted (until 26 October
+    \texttt{make check} failed it on false messages, see the
+    \texttt{make check} row) or not ending the wait; a STOP
+    ignored while waiting; the raw codes not published while waiting, or
+    the memory barrier after the wait for the sample removed;
+    \code{out.*} not published; the state into \code{g_buck.st};
+    $\hat v$ seeded at 0; \code{state} not set; the arming CYCCNT after
+    the counter; the stamps stored before the first CMP1 write; the first
+    pass's stamps not stored after its CMP1 write, on its trip or on a
+    stop; \code{trip_cyc} not stored. The RAM-execution linker script (used by
+    no configuration) now overflows by 24\,B (fits with
+    \code{-DBUCK_BENCH=0}). \\
+Review of the fix (25 October, late).
+  & Two further reviews (an emulator of the linked code, and a clock
+    counter written independently of the one above) confirmed the build
+    and the figures and found wording to correct, corrected in
+    \texttt{Inc/buck.h}, \texttt{Inc/buck\_config.h}, comments in
+    \texttt{Src/buck.c}, the README and this memo: the 176--220 clocks at
+    4096 had been given as the first write's margin (it is 126--144 at
+    every arming point); the arming CMP1 write's position, the tighter
+    limit on \code{BUCK_ARM_LATEST}, was not stated; the ordinary copies
+    had been called the same instructions; \code{trip_cyc} had been called
+    the first instruction of every trip branch; a wrapped \code{first_cnt}
+    (below 2048, fault~5: the margin row then reads 6401--8448 and the
+    cycle formula needs $n > 1$) and $\mathtt{first\_cyc} -
+    \mathtt{arm\_cyc}$ with \code{first_*} $=$ \code{0xFFFFFFFF} were not
+    explained; the stamps are not stored on a sample timeout (this was in
+    the open points only); \code{g_buck.st} is no longer written at
+    arming. No code changed: the \texttt{.bin} is byte-identical (sha1
+    e5c7798f\ldots), \texttt{make}, \texttt{make check} and
+    \texttt{make test} as above. \\
+Third review (26 October).
+  & A check of \texttt{make check}'s self-tests against broken versions
+    of the checker, and of the documents. Fixed in
+    \texttt{tools/check\_loop.py}: the false CMP1 messages and the
+    self-test gaps (the \texttt{make check} row); every firmware mutant
+    caught before is still caught with the same message, and the others
+    still pass, the bad sample not counted now included (Results row).
+    Corrected or added in the README and this memo: the review-only list;
+    the first pass's whole length (item~4); the ordinary passes' nominal
+    figures in the README table's convention (147.1 / 150.1 / 154.1 /
+    154.1, 7.06 wait clocks); \code{arm()}'s \code{out.g} store between
+    CMP1 and OENR; the derived rows before the first start (8448 and 0);
+    a third option for the arming write, and the rebuild before the board
+    run (below). No firmware file changed: the \texttt{.bin} is
+    byte-identical (sha1 e5c7798f\ldots). \\
+Left for you (25 October; status 28 October: the fix ran on 27 October,
+reported working, no data read; you chose not to add the stamp rows to the
+workspace's list; see Section~\ref{sec:followup1028} for the arming write,
+the passes and the expected stamp values of the 28 October build).
+  & Rebuild Debug in CubeIDE (or relaunch with build-before-launch) and
+    flash it first: the Debug ELF that ran on 25 October (built 21:04) is
+    the code before the fix, and restarting inside a session started
+    with it runs that code again. The new code is loaded when the
+    \code{arm_cnt} Live Expressions row evaluates and reads non-zero after
+    a start; the workspace's list still had only the 41 old rows (25
+    October evening), and the seven new ones are added with the README's
+    \texttt{cp} command with CubeIDE closed (not done; on 28 October you
+    chose not to add them).
+    Run it on the board and read \code{arm_cnt} (about 2100--2650
+    expected), $8448 - \mathtt{first\_cnt}$ (about 4000--4600 ticks,
+    126--144 clocks; about 3450--4150 with the board's 16--20\,\%),
+    $\mathtt{first\_cyc} - \mathtt{arm\_cyc}$ (326--345; about 335--356)
+    and \code{busy_max} (150--157 if the model holds). Open points, each
+    implemented in the most conservative reading: the first pass as a
+    fifth copy with its step chosen at run time and the copy re-chosen
+    after it (four copies with the step built in: 1.4\,KB more and 2--3
+    clocks later CMP1 writes); a debugger write of \code{state} or
+    \code{warmup} during the wait is not seen; the stamps are stored by
+    the first pass, so a sample timeout (fault~4) or a CPU fault before
+    it leaves the previous start's values, which nothing in \code{g_buck}
+    tells apart (storing them at the arming or on the timeout path would
+    change the design); \code{0xFFFFFFFF} for a first pass that stopped
+    before its check; the ordinary copies' normal passes are not
+    instruction-identical to the build before (item~4: whether that is
+    acceptable); the stamps' CYCCNT reads sit just before the counter
+    reads, on the paths (the first pass's costs 1~clock on its write;
+    read right after the \code{strcc} instead, 5--6~clocks after the
+    counter read, it would be off the path, but \texttt{make check} then
+    needs the \code{bcs} rule widened); \code{BUCK_ARM_LATEST} kept at
+    4096 though the arming write lands only 24--37 clocks (pessimistic)
+    before 264 there (lower it; store \code{out.*} after OENR: 6--7
+    clocks; or hold \code{buck_ctrl_arm}'s float constants across the
+    wait, loaded in the entry, not built: between the arming check's
+    counter read and that write the board's path makes 10 CCM literal
+    loads, 16~clocks static and 27 nominal together, nine of them those
+    constants, without whose loads it is 13~clocks static and about 23
+    nominal shorter, at a possible cost to the passes' register
+    allocation, as the entry's \code{asm} with its values as
+    \texttt{"+t"} outputs (counted, not kept) cost 1--3 clocks per pass);
+    a window rule in \texttt{make check}; the
+    RAM script's 24\,B; two comments in the host test still describe the
+    seed and the gains' check at ``the loop entry'' (test unchanged). \\
+\bottomrule
+\end{xltabular}}
+
+% ============================================================
+\section{Follow-up Requests, 28 October (Buck\_disturb\_obs: fewer clocks, the same results)}
+\label{sec:followup1028}
+% ============================================================
+
+You asked for the loop to use fewer clocks while keeping the trigger
+score, the PI calculation, the observer and the sensing as they are,
+with bit-identical results only (NaN payloads included; FMA stays off).
+Two scouting rounds ran in scratch copies of the project, each candidate
+checked against the 25~October evening build (bin e5c7798f\ldots, the
+build you reported working on the board on 27~October) in a differential
+emulator. On 28~October you chose the ``recommended merged'' build, and it
+was applied in place. Its verification found one more operand swap (row~5),
+which you had pinned the same day (row~11); the check of the pin corrected the
+figure for the read instants of the tunables, and you accepted the measured
+instants (row~12). Clock figures are counted on the linked ELF by two
+counters, both with your static model and the boot benchmark's wait states
+(nominal; pessimistic with CCM literals at $+2$): counter~1 (c1) costs the
+paths the differential emulator executes over 26 scenarios, counter~2 (c2)
+walks every path. Both are scratch tools, not in the project. Nothing of
+this build has run on the board.
+
+{\small
+\renewcommand{\arraystretch}{1.25}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.27\linewidth}L@{}}
+\caption{Requests and decisions, 28 October (the clock optimisation).}
+\label{tab:followup1028}\\
+\toprule
+\textbf{Request or decision} & \textbf{Answer and result} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Request or decision} & \textbf{Answer and result} \\
+\midrule
+\endhead
+1.\ Fewer clocks; keep the score, the PIs, the observer and the
+sensing; bit-identical results only; FMA off.
+  & Round~1: path, bus, math and structure scouts, merged into one set
+    (SET~I). Round~2: SET~I rebased without P3 and re-searched, the
+    post-pass variants (tscout), and their merge. Every candidate ran
+    through the differential emulator against the 25~October evening
+    build; two defects found on the way (F1, F2 below) were fixed before
+    the choice. \\
+2.\ Apply the ``recommended merged'' build (your choice, 28~October).
+  & Done, after a full backup of the project: the patch (sha1
+    3f11d22f\ldots, 1001 lines) changes \code{Src/buck.c},
+    \code{Inc/buck_ctrl.h} and \code{Inc/buck_config.h} (a comment); bin
+    2f144a53\ldots{} (12\,540\,B; \code{.ccmtext} 9888\,B; \code{run_loop}
+    8764\,B), the bin the scouting round checked. Then comments only:
+    \code{Src/buck.c}, \code{Inc/buck_ctrl.h}, \code{Inc/buck_config.h},
+    \code{Inc/buck.h}, the README and this memo; the bin is unchanged.
+    The pin of row~11 followed the same day (bin 5b99a0d5\ldots).
+    \code{g_buck} is unchanged (248\,B; \code{busy_max} at offset 156, the
+    stamps at 228--244). What changed, each the same operations on the
+    same values: the arming writes CMP1 (from $v_\mathrm{out}$ alone) and
+    OENR first, everything else after a memory barrier, with the arming's
+    and the first pass's constants in registers loaded at the entry; the
+    first pass always takes the UP step; the deadline check is an
+    \code{asm goto}; the valley and integrator updates follow the CMP1
+    write; the pass's I/O is \code{ldr}/\code{str} at offsets from ADC1's
+    base; ADC2$\times$0.25 is one \code{vcvt}; BSRR from one MOV and
+    \code{out.g} from the BSRR word; a pre-biased Pad\'e table base; the
+    gains' check forms both difference orders; the copies' constants in
+    registers formed once after the first pass (\code{run_ctx_t.q}); the
+    first pass goes straight into the copy of its mode; the telemetry pass
+    out of line; \code{busy_max}'s second CYCCNT read through the DWT base
+    in a register (BD); the post pass (row~3). \code{RUN_CODE}:
+    \code{hot, optimize("O3", "no-if-conversion", "no-crossjumping",
+    "no-schedule-insns")}, copies in the order HOLD, UP, DOWN, FREE\_UP
+    (before: \code{"no-tree-coalesce-vars", "no-tree-ter"}; UP, FREE\_UP,
+    HOLD, DOWN), chosen from 35 flag sets $\times$ 24 orders (840 builds)
+    as no worse than the 25~October evening build on any target in either
+    counter and the best on the most. \\
+3.\ The exact $\beta/\gamma$ check stays in the tunables pass (your
+decision; P3, which moved it into the next pass, rejected).
+  & Kept there and at the loop entry, unchanged. Only the target of the
+    new tunables and the reference step for the next 64 passes moved: the
+    pass after a tunables pass (the post pass) runs in the same copy and
+    forms them after its CMP1 write, then takes that step itself. The
+    values are the same and are used from the same passes. \\
+4.\ Rejected options.
+  & P3 (the gains' check in the pass after the tunables pass);
+    S3 (the first pass as an ordinary pass of its copy: first pass 43
+    clocks shorter, but the arming path back at the 25~October length and
+    \code{first_cnt}, \code{first_cyc} lost); C10 (the arming CMP1 from a
+    16\,KB CCM table); B3/B8 (the tunables pre-written into an appended,
+    debugger-writable \code{g_buck} field). \\
+5.\ NaN payloads.
+  & Fixed by the merge (F1): the current PI's product $k_p e$ in the
+    post pass had its operands swapped, which changes the NaN payload in
+    \code{g_buck.st.integ_i} at the next stop when both are NaN; its order
+    is now pinned (\code{buck_mul_nm}: $k_p$ first in the first pass, $e$
+    first in the copies, as the 25~October build), like the five earlier
+    pins (current scaling, $\alpha e$, the average, the valley, the score's
+    two additions). Your first decision: no new pins; the observer's
+    prediction and the clamped PI sum unpinned (three two-NaN sites,
+    listed at the end of this row, whose NaN payloads cannot reach an
+    output). The check
+    after the change
+    (row~9) found that
+    the prediction $\hat v + a(i_L - \hat\imath)$ had its operands swapped
+    in the post pass of every copy ($\hat v$ first; the product first in
+    the 25~October build), which changed \code{out.i_load}'s NaN payload
+    in one narrow case. Your second decision (row~11): pinned there, the
+    product first (\code{buck_obs_step_ao}, with \code{buck_add_nm}); the
+    first pass ($\hat v$ first in both builds) and the other passes keep
+    the compiler's order. Three two-NaN sites stay unpinned (row~9): the
+    voltage-PI and the current-PI clamped sums and the current PI's
+    product $k_i T e$, which feeds only its sum. The clamp turns a NaN sum
+    into the lower limit, so none of their NaN payloads can reach an
+    output. \\
+6.\ Tunables read once per 64 passes.
+  & Fixed by the merge (F2): GCC re-loaded the 14 tunables from
+    \code{g_buck.tune} at the top of the post pass in a
+    \code{BUCK_ADC_CSR_POLL = 0} build (legal C, but a debugger write at
+    that pass's sample would be taken one pass early). A memory barrier
+    right after \code{c->t = b->tune} prevents it; the tunables are read in
+    exactly the base's passes (row~9). With
+    \code{BUCK_ADC_CSR_POLL = 0} the passes use \code{wait_sample()}
+    (P1). \\
+7.\ \code{trip_cyc}: comments only (your decision).
+  & No code change. Every trip branch, the first pass's included, now
+    starts with a literal load of the DWT base from CCM and then the
+    CYCCNT read (in this, the \code{BUCK_ADC_CSR_POLL = 1} build; built
+    with 0, one branch has a register move between the two): 11~clocks static after the counter read in the ordinary
+    copies, 10 in the first pass, whose counter read pipelines behind its
+    own CYCCNT read (14 / 13 with the counter read's wait, about 1 more
+    nominal for the literal's); before 11--16. Comments in
+    \code{Src/buck.c}, \code{Inc/buck.h} and the README updated. \\
+8.\ \code{busy_max} and the five stamps kept; \texttt{make check} with
+\code{BUCK_ADC_CSR_POLL = 0} left failing; the stamp rows not added to the
+workspace's Live Expressions (your decisions).
+  & \code{busy_max}'s window is 137 / 137 / 142 / 142 static, 144 / 144 /
+    149 / 149 nominal (HOLD / FREE\_UP / UP / DOWN; before 143 / 146 /
+    150 / 150 and 150.12--157.12). Its second CYCCNT read no longer
+    follows a literal-pool load inside the window (2~clocks static, about
+    3 nominal in the 25~October build), so the board reads a few clocks
+    less for the same work. The checker fails both
+    \code{BUCK_ADC_CSR_POLL = 0} builds (base and new) with ``no pass head
+    (ADC12\_CSR read) found''; \texttt{tools/check\_loop.py} is unchanged.
+    The workspace's \texttt{.metadata} was not touched. \\
+9.\ Proof of bit-identity and its scope.
+  & Differential emulator (scratch): both linked ELFs run instruction by
+    instruction on the same sample streams and debugger writes; compared:
+    every peripheral write and its order within each pass, every
+    \code{g_buck} field a debugger can see pass by pass (\code{busy_max},
+    \code{bench}, \code{rst_cause} and the stamps reported, not compared),
+    faults and their moments. Suites (each with the new build, bin
+    5b99a0d5\ldots, at 1.0$\times$, 1.3$\times$ and 0.6$\times$ speed,
+    strict write order): 901 scenarios (the standard 887 and 14 around the
+    tunables and post passes), 1641 (the 887, 46 at the post pass, 708
+    with debugger writes at the post pass's sample, gain sequences and NaN
+    pairs per transition), 1069 (the 887 and 182 with NaN tunables taken
+    up at a tunables pass and a STOP right after the post pass), and the
+    verifier's \texttt{vbit} group, 352 scenarios aimed at the post pass
+    (random and special tunables, NaN, $\pm\infty$, subnormal sensing and
+    score values, every copy transition, stops and restarts): all the same
+    except 5 of the 708 (\code{vt_tr_stall_*}), where the 25~October
+    build trips its own fault~5 after a debugger stall and the new one
+    does not (the same with the base at 0.9$\times$). Before the pin of
+    row~11 (bin 2f144a53\ldots) 14 of the 352 differed at all three
+    speeds: when the measured current overflows to $\pm\infty$ in a
+    tunables pass (only with extreme sensing tunables written by the
+    debugger, e.g.\ a current gain of the order of $10^{35}$ or more with a
+    full-scale sample) and the sensing tunables that pass takes are NaN,
+    that build published the default NaN in \code{out.i_load} where the
+    25~October build publishes the tunable's NaN (the A2 code 0 in both).
+    Instruction-level NaN check (\texttt{nanops.py}; every FP operation
+    with two NaN operands, in the 611 NaN scenarios of the standard suite
+    and in the 352): at every pinned site, the observer's prediction
+    included, the base's result in every case there; the only differences
+    are at the clamped PI sums (the voltage and the current PI's sum, and
+    the current PI's product $k_i T e$, which feeds only its sum: 116 and
+    276 cases of pass, operation and operands), which no output can
+    carry. That check sees an operand-order
+    difference only where two NaNs of different payloads meet. The
+    operand-order check (\texttt{opsorder.py}, added by the verification
+    after the change) records the operand order of every executed FP
+    addition and multiplication whatever the values, in the 901 and the
+    352: every pinned site keeps the base's order, the observer's
+    prediction now included (before the pin it was swapped in the post
+    pass of every copy); the other operations whose order changed cannot
+    meet two NaN operands, or their result cannot reach an output.
+    Tunables-read check: \code{g_buck.tune} is read in the same passes in
+    both builds. \code{BUCK_ADC_CSR_POLL = 0}: 0 warnings, no ADC12\_CSR
+    read in \code{run_loop}, the 901 scenarios the same at all three speeds
+    against the base built the same way. \texttt{make test} compiles
+    \code{Inc/buck_ctrl.h} only; its output is identical, line for line
+    (134 lines: the compile command, the test program's name and its 132
+    lines of output). Scope: the emulator's scenarios and its peripheral model;
+    timing on the board is not modelled beyond the clock counters. Your
+    decisions of rows~11 and~12 set the rest of the scope: FPSCR (its cumulative
+    exception flags IOC, OFC, \ldots{} and NZCV) is not part of the
+    results, since no code reads its flags (the only FPSCR access in the
+    code is \code{vmrs APSR_nzcv, fpscr} right after an FP compare, which
+    reads the NZCV that compare has just set; there is no
+    \code{vmsr}); a debugger write to \code{g_buck.tune} must be taken in
+    the same pass as in the base, and it is (the emulator injects writes
+    at pass boundaries), while the instants of the reads moved: in the
+    tunables pass the 12 fields other than the observer gains 0--47 clocks
+    earlier and the gains from 13 earlier to 9 later; at the loop entry
+    \code{vref_counts} 35--54 and the gains 22--38 clocks later
+    (row~12). \\
+10.\ Clock figures.
+  & Table~\ref{tab:clocks1028}. Against the 25~October evening build
+    the new build is no worse on any target (CMP1 after EOC, normal pass
+    worst and mean, \code{busy_max} window, longest pass, first pass and
+    its CMP1, arming path, arming write), static, nominal, pessimistic and
+    with VLDR/VSTR at 2~clocks (FP2), in either counter. Higher, not
+    targets: the post pass (it carries the target and ramp-step work; its
+    CMP1 at 68 / 74 after EOC) and the loop entry in the stopped period
+    (constants loaded there; the stopped cycle that sees RUN still reaches
+    the arming wait at most 200~clocks, pessimistic, after its EOC read).
+    Against round~1's SET~I (scratch only) no worse static and nominal,
+    but not under FP2: every normal pass $+1$ (151 against 150, c1), and
+    FREE\_UP's \code{busy_max} window $+1$ static (144 against 143 by c1,
+    143 against 142 by c2; nominal 151 against 151.06, c1); HOLD's window
+    is 1 shorter and UP's and DOWN's are equal, so the worst copy's window
+    is equal. The pin of row~11 changes none of these figures. \\
+11.\ Your decisions of 28~October, second set (after the verification of
+the applied build).
+  & (1) Pin the observer's prediction with the product first in the post
+    pass only. The verifier found (BITID-1, reproduced twice) that the post
+    pass of every copy added it with $\hat v$ first, the only place where
+    the compiler chose that order in the copies. Done:
+    \code{buck_obs_step_ao} in \texttt{Inc/buck\_ctrl.h}, called with
+    \code{epoch != 0} in \code{run_pass()}; the ordinary passes and the
+    first pass keep their instructions. Bin 5b99a0d5\ldots{} (the same
+    sizes); only the post pass's instructions changed (the four
+    \code{vadd}s swap their operands, and the 4 to 11 instructions after
+    each are reordered: most move by one place; in the UP, DOWN and
+    FREE\_UP copies one multiplication moves two places and one
+    subtraction five, three in FREE\_UP; no store or peripheral access
+    moves); both counters' outputs are byte-identical
+    to 2f144a53's, FP2 included (0~clocks); results in row~9. Your
+    first-set decision ``no new pins'' rested on a wrong premise, which I
+    gave you with the options: that the instruction-level NaN check guards
+    the unpinned sites. That check sees a swap only where two NaNs of
+    different payloads meet in one of its scenarios; the operand-order
+    check records the operand order of every FP addition and
+    multiplication the scenarios execute, NaN or not, and compares it with
+    the base's pass by pass, so it sees a swap at every such instruction
+    that both builds execute in the same pass with two different operands,
+    and it showed this one. It never compares eight post-pass
+    instructions, which run one pass later than in the base (it formed them in the tunables
+    pass): the ramp target's multiplication by \code{BUCK_V_PER_COUNT}
+    and \code{buck_ramp_mode}'s addition of \code{BUCK_RAMP_FAR_V}, in
+    each of the four copies. Each has a constant operand, so a swap there
+    cannot change a NaN payload, and the conclusion holds.
+    (2) FPSCR, its cumulative exception flags (IOC,
+    OFC, \ldots) and NZCV, is outside ``results'': no code reads its flags
+    (row~9). The new build's gains' check forms both difference orders
+    unconditionally, so it can set IOC or OFC where the base sets none.
+    (3) Debugger writes to \code{g_buck.tune}: taken in the same pass as
+    before is the requirement; the instants of the reads inside the
+    tunables pass may move. The figure I gave you with this question,
+    ``2--37 clocks earlier'', was wrong, and I did not mention that at the
+    loop entry \code{vref_counts} and the gains are read later; your third
+    set (row~12)
+    accepts the measured instants, the loop entry's included (in the
+    tunables pass from 47 clocks earlier to 9 later, at the loop entry
+    from 28 earlier to 54 later); a write that lands between the two
+    builds' reads of a field is taken one reload apart. (4) The
+    RAM-execution linker script's overflow (P8: 3096\,B; it no longer fits
+    with \code{-DBUCK_BENCH=0}) is left as it is. \\
+12.\ Your decisions of 28~October, third set (after the check of the
+pin).
+  & (1) The read instants of \code{g_buck.tune}: you accepted the
+    measured instants, the loop entry's included; documents only, no code
+    change (not taken: reading the tunables earlier at the loop entry, a
+    code change, not explored). The figure given to you before, ``2--37
+    clocks earlier'' for the 12 fields other than the observer gains in
+    the tunables pass (row~11 (3), and in row~9 and the README until
+    then), was wrong: it was measured on one scenario and does not
+    reproduce there (\code{plain}: in its ten tunables passes those fields
+    5--42 clocks earlier, 5--31 in pass~87). Measured over the 901 scenarios (the first
+    load of each field, in clocks after the pass's EOC, at 1.0$\times$;
+    the 25~October evening build against bin 5b99a0d5\ldots): in the
+    tunables pass the 12 fields other than the observer gains are read
+    0--47 clocks earlier (each field's 1st to 99th percentile within
+    3--45 earlier) and the
+    gains from 13 earlier to 9 later. At the loop entry (the stopped
+    cycle that sees RUN, which a debugger halt can delay, as in the
+    scenario \code{halt_in_entry})
+    \code{vref_counts} is read 35--54 clocks later, the gains 22--38
+    later, \code{kp_v} from 5 earlier to 14 later and the other ten from
+    28 earlier to 9 later. \code{g_buck.tune} is read in the same passes
+    in both builds (13\,285 passes, no scenario differs). A write that
+    lands between the two builds' reads of a field is taken one reload
+    apart, by the build that reads that field first only at its next
+    reload: in the tunables pass that is mostly the new build (it takes
+    the write a reload later), at the loop entry, for \code{vref_counts}
+    and the gains, the 25~October build (the new build takes it a reload
+    earlier). A write that spans several fields can be split between old
+    and new values differently. (2) The comment-only edits beyond the pin
+    are kept: in \code{Src/buck.c} ``(27 Oct)'' became ``(scouted 27 Oct,
+    applied 28 Oct)'' at five places; in \code{Inc/buck_ctrl.h} the
+    comments on \code{buck_iload_obs()} no longer say that
+    \code{run_pass()} calls it (the host tests do; \code{run_pass()} runs
+    the same step through \code{buck_obs_step_ao} and
+    \code{buck_iload_dac_k}), and the pin's comment says ``so did the
+    28 Oct build before this pin (bin 2f144a53)''. They change no
+    instruction (bin 5b99a0d5\ldots). Corrected at the same time,
+    documents only: row~11 (1) (the eight instructions the operand-order
+    check never compares), the line count of \texttt{make test} (row~9)
+    and the unpinned clamped PI sums (row~5 and below). \\
+Left open.
+  & Not run on the board: rebuild Debug in CubeIDE before flashing
+    (CubeIDE rebuilt \texttt{Debug/} at 21:33 on 28~October; its ELF
+    gives bin 5b99a0d5\ldots; no board run with it has been reported).
+    Expected on the board (estimates from the counters, no board data):
+    \code{arm_cnt} about 1800--2350 ticks; $8448 - \mathtt{first\_cnt}$
+    about 4700--5250 ticks (146--164 clocks; about 4250--4900 with the
+    board's 16--20\,\%); $\mathtt{first\_cyc} - \mathtt{arm\_cyc}$ about
+    315--334 (322--343); \code{busy_max} about 144--149 (167--179).
+    Left as it is (your decision, row~11): P8, the RAM-execution linker
+    script's overflow, now 3096\,B (101\,400 of 98\,304\,B; 2072\,B with
+    \code{-DBUCK_BENCH=0}, which no longer fits; 24\,B before).
+    Kept as they are, unanswered: the wiring checks (V3-1: wiring mistakes
+    in \code{Src/buck.c} that pass all three checks, review only). The
+    clamped PI sums stay unpinned (row~5: three two-NaN sites, the
+    voltage-PI and the current-PI sums and the current PI's product
+    $k_i T e$, which feeds only its sum; none can carry its NaN payload
+    to an output); \texttt{make check} fails with
+    \code{BUCK_ADC_CSR_POLL = 0} (row~8). The scratch timing tool
+    \texttt{vtime.py} has a wrong comment on \code{g_buck.out}'s offset
+    (\code{out} is at 0x44, \code{st} at 0x70); it changes no figure. \\
+\bottomrule
+\end{xltabular}}
+
+\begin{table}[H]
+\centering
+\caption{Clock figures, 28 October build (bin 5b99a0d5\ldots; 2f144a53\ldots{}
+the same) against the
+25 October evening build (in brackets), static / nominal. ``Table'' is
+the README convention (body plus the closing status read); ``with head''
+from the status read that finds EOC to the next pass's first status read.
+c1 = c2 where one value is given.}
+\label{tab:clocks1028}
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.34\linewidth}LL@{}}
+\toprule
+\textbf{Figure} & \textbf{28 October} & \textbf{[25 October evening]} \\
+\midrule
+CMP1 after EOC, every pass but the first, worst
+  & 68 / 74 & c1 82 / 88; c2 79 / 85 (poll head), 82 / 88 (late head) \\
+normal pass (table), HOLD / FREE\_UP / UP / DOWN
+  & 137 / 138 / 143 / 143; 145 / 146 / 151 / 151
+  & 140 / 143 / 147 / 147; 147.06 / 150.06 / 154.06 / 154.06 \\
+normal pass, mean of the copies
+  & 140.25 / 148.25 & 144.25 / 151.31 \\
+\code{busy_max} window
+  & 137 / 137 / 142 / 142; 144 / 144 / 149 / 149
+  & 143 / 146 / 150 / 150; 150.12 / 153.12 / 157.12 / 157.12 \\
+telemetry pass (table)
+  & 171 / 172 / 178 / 178; 179 / 180 / 186 / 186
+  & 182 / 185 / 189 / 189; 190.12 / 193.12 / 197.12 / 197.12 \\
+longest pass with head (UP/DOWN tunables pass); pessimistic
+  & 210 / 220.12; 222 & 271 / 294; 309 \\
+pass after a tunables pass, with head (not a target)
+  & c1 175 / 187.25; c2 177 / 189.25 & an ordinary pass, 154 / 161.06 \\
+first pass, EOC to the next head; its CMP1 after EOC
+  & 188 / 204.5; 68 / 74
+  & c1 219 / 248.31, c2 221 / 250.31; c1 82 / 95.44, c2 81 / 94.44 \\
+arming counter read to the first pass's guarded counter read
+  & c1 144 / 153.12; c2 141 / 150.12 & c1 194 / 220.19; c2 195 / 221.19 \\
+arming counter read to the arming CMP1 write
+  & 29 / 33 & 88 / 102.62 \\
+loop entry, stopped period (not a target)
+  & c1 120 / 139.12; c2 124 / 145.25 & c1 103 / 111.5; c2 103 / 113.62 \\
+worst normal pass with VLDR/VSTR at 2 clocks (FP2)
+  & c1 151 / 159; c2 150 / 158 & c1 156 / 163.06; c2 154 / 161.06 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ============================================================
+\section{Follow-up Request: Live Expressions}
+% ============================================================
+
+\begin{description}
+\item[Request.] Clear the old Live Expressions and provide a new list
+for this firmware.
+\item[Result.] The old 44-row list (names from
+\code{Buck_Voltage_Mode}) was removed from the CubeIDE workspace and
+backed up as \code{saved_expr.dat.pre_current_mode_bak}. A new
+35-row list was installed, and a copy is kept in
+\code{tools/live_expressions.txt}. On 27 September
+(Section~\ref{sec:followup}) \code{bench}, \code{tune.ev_norm},
+\code{tune.du_norm} and \code{trip_cnt} were added, and
+\code{tune.iload_n} was added and later removed: 39 rows. On 28 September
+(Section~\ref{sec:followup28}) \code{tune.iload_s0} and
+\code{out.i_load_lvl} were added: 41 rows in all. In BUCK\_Adpt\_Learning
+(24 October) they are replaced by \code{tune.iload_tau0} and
+\code{out.i_load_alpha}: still 41 rows. On 25 October \code{tune.rho},
+\code{tune.ev_norm} and \code{tune.du_norm} were replaced by
+\code{tune.score_a}, \code{tune.score_b}, \code{tune.score_c} and
+\code{tune.iload_s_th}: 42 rows. In this copy, Buck\_disturb\_obs
+(25 October), the two observer gains \code{tune.obs_beta} and
+\code{tune.obs_gamma} replace the three rows \code{tune.iload_tau0},
+\code{tune.iload_s_th} and \code{out.i_load_alpha}: 41 rows. On the
+evening of 25 October (Section~\ref{sec:followup1025f}) the start's
+timing stamps \code{arm_cnt}, \code{arm_cyc}, \code{first_cnt},
+\code{first_cyc}, \code{trip_cyc} and the two rows
+\code{first_cyc-arm_cyc} and \code{8448-(int)first_cnt} were added:
+48 rows. You chose (28 October) not to add these seven rows to the
+workspace's Live Expressions list; they are in
+\code{tools/live_expressions.txt}, and the command below restores the
+whole list if wanted. Every row was checked with
+\texttt{gdb} against both the command-line and the CubeIDE Debug build
+(Buck\_disturb\_obs: against the command-line build).
+\end{description}
+
+\begin{table}[H]
+\centering
+\caption{Groups in the new Live Expressions list.}
+\label{tab:live}
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l r L@{}}
+\toprule
+\textbf{Group} & \textbf{Rows} & \textbf{Contents} \\
+\midrule
+Controls    & 18 & \code{command}, \code{state}, \code{fault};
+                     all \code{tune.*} values (V$_{\mathrm{ref}}$ in counts
+                     and volts, four PI gains, $\alpha_I$,
+                     $S_{\mathrm{th}}$, the score coefficients $a$, $b$,
+                     $c$, the observer gains $\beta$ and $\gamma$, A1 zero
+                     and gain) \\
+Raw ADC     & 3  & $v_{\mathrm{out}}$ in V, A1 in counts, A1 current in A;
+                     live even when stopped, for the A1 zero calibration \\
+Outputs     & 13 & \code{out.*}: $v_{\mathrm{out}}$, $V_{\mathrm{ref}}$,
+                     $e_v$, measured and estimated average current,
+                     residual, peak, the observer's load current,
+                     $u[k]$, $S[k]$, $g[k]$,
+                     CMP1 and the physical duty; live only while running \\
+Diagnostics & 14 & \code{busy_max} (keep below about 240),
+                     \code{loops}, \code{adc_miss}, \code{warmup},
+                     reset cause, bus benchmark \code{bench},
+                     \code{trip_cnt} and \code{trip_cyc} (fault 5), the
+                     start's stamps \code{arm_cnt}, \code{arm_cyc},
+                     \code{first_cnt}, \code{first_cyc}, and
+                     \code{first_cyc-arm_cyc},
+                     \code{8448-(int)first_cnt} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+CubeIDE overwrites its copy when the view or the IDE closes. To restore
+the list, close CubeIDE and run from the project folder:
+\begin{center}
+{\footnotesize\code{cp tools/live_expressions.txt ../.metadata/.plugins/com.st.stm32cube.ide.mcu.livewatch/saved_expr.dat}}
+\end{center}
+
+\end{document}

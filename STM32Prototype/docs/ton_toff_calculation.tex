@@ -1,0 +1,442 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible,breaklines=true,
+  frame=single,framesep=4pt,rulecolor=\color{gray!40},backgroundcolor=\color{gray!5}}
+
+\newcommand{\Ton}{T_{\mathrm{on}}}
+\newcommand{\Toff}{T_{\mathrm{off}}}
+\newcommand{\Vin}{V_{\mathrm{in}}}
+\newcommand{\Vref}{V_{\mathrm{ref}}}
+\newcommand{\Vout}{V_{\mathrm{out}}}
+\newcommand{\Ipk}{I_{\mathrm{pk,max}}}
+\newcommand{\Tsw}{T_{\mathrm{sw}}}
+
+\title{\vspace{-1.5em}Time--Optimal $\Ton/\Toff$ Computation\\[0.3em]
+\large STM32G474 Voltage--Mode Synchronous Buck --- Large--Signal Load--Step Response}
+\author{G.\ Qian}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1em}
+
+\begin{abstract}
+\noindent This note documents exactly how the firmware computes the single
+ON--OFF switching times $\Ton,\Toff$ that are applied for one stretched HRTIM
+period on a detected load step--up. It covers (i) the second--order model and the
+two terminal equations, (ii) their reduction to a single quadratic (one square
+root) as implemented in \texttt{buck\_optimal\_onoff()}, (iii) root selection and
+clamps, (iv) the ISR closed form that replaced it and its pipeline (peak--current
+limit, time clamps, tick quantization), and (v) the Jacobian timing adaptation
+and the post--pulse reseed. Symbols map one--to--one to the C source.\end{abstract}
+
+\section{Plant model and shifted state}
+The synchronous buck averaged over a switching action is a second--order LC plant
+with a lumped series resistance $r$ (inductor DCR $+$ FET/path):
+\begin{equation}
+L\,\frac{di_L}{dt}=v_{\mathrm{sw}}-\Vout-r\,i_L,\qquad
+C\,\frac{d\Vout}{dt}=i_L-i_{\mathrm{load}},
+\end{equation}
+with $v_{\mathrm{sw}}=\Vin$ while the high side is ON and $v_{\mathrm{sw}}=0$
+while it is OFF. Define the ramp rates
+\begin{equation}
+\theta=-\frac{r}{L},\qquad
+m_1=\frac{\Vin-\Vref}{L},\qquad
+m_2=\frac{\Vref}{L},\qquad
+m_\Sigma=m_1+m_2=\frac{\Vin}{L}.
+\end{equation}
+
+After a load step the controller works in the \emph{shifted state} measured at the
+step (all in SI units), taken from the Pad\'e current/load estimator:
+\begin{equation}
+z_i=i_L-\hat I_{\mathrm{load,new}},\qquad
+z_v=\Vout-\Vref,\qquad
+\hat I=\hat I_{\mathrm{load,new}} .
+\end{equation}
+In the code (\texttt{buck\_optimal\_service}), $i_L=$ \texttt{cap\_iavg\_q20},
+$\hat I=$ \texttt{cap\_iload\_q20} (both Q20 A), and
+$\Vout=$ \texttt{cap\_adc}$\times$\texttt{UV\_PER\_COUNT}. The goal is to drive
+$(z_i,z_v)\to(0,0)$ in \emph{one} ON--OFF action of durations $\Ton,\Toff$.
+
+\section{Terminal equations}
+Propagating the shifted state through the ON interval of length $x=\Ton$ then the
+OFF interval of length $y=\Toff$ with the second--order bilinear (Pad\'e)
+state--transition and requiring the final shifted state to vanish yields two
+coupled equations (TPEL Sec.~IV, eqs.~35--36; verified against a direct Newton
+solve to $\sim\!10^{-16}$ in \texttt{Tests/test\_optimal.c}):
+\begin{align}
+0&=z_i+p\,x+q\,y+g\,x\,y, \label{eq:e1}\\
+0&=z_v+\tfrac{z_i}{2C}\,(x+y)+b\,x\,y, \label{eq:e2}
+\end{align}
+with coefficients
+\begin{align}
+p&=\tfrac{\theta}{2}z_i-\tfrac{z_v}{2L}+m_1-\theta\hat I, &
+q&=\tfrac{\theta}{2}z_i-\tfrac{z_v}{2L}-m_2-\theta\hat I,\\
+g&=\tfrac14\!\left(\theta^2-\tfrac{1}{LC}\right)z_i-\tfrac{\theta z_v}{4L}
+   +\tfrac{\theta m_\Sigma}{2}, &
+b&=\tfrac{\theta z_i}{4C}-\tfrac{z_v}{4LC}+\tfrac{m_\Sigma}{2C}.
+\end{align}
+A useful identity used below is
+\begin{equation}
+p-q=m_1+m_2=m_\Sigma=\frac{\Vin}{L}\ \Longrightarrow\ \frac{1}{p-q}=\frac{L}{\Vin}.
+\label{eq:pmq}
+\end{equation}
+
+\section{Reduction to one quadratic (single square root)}
+Let $s=x+y=\Ton+\Toff$ and $b_1=\dfrac{z_i}{2C}$.
+
+\paragraph{Step 1 --- eliminate the bilinear term.}
+From \eqref{eq:e2}, $b\,x y=-(z_v+b_1 s)$, i.e.
+\begin{equation}
+x\,y=-\frac{z_v+b_1 s}{b}. \label{eq:xy}
+\end{equation}
+
+\paragraph{Step 2 --- make $\Ton$ affine in $s$.}
+Substitute $y=s-x$ and the product \eqref{eq:xy} into \eqref{eq:e1}. The bilinear
+term $g\,x y$ becomes $-g\,(z_v+b_1 s)/b$, leaving a \emph{linear} equation in $x$:
+\begin{equation}
+z_i+q\,s+(p-q)\,x-\frac{g}{b}\,(z_v+b_1 s)=0 .
+\end{equation}
+Solving for $x$ and using \eqref{eq:pmq},
+\begin{equation}
+\boxed{\;x=\Ton=a_0+a_1 s,\qquad
+a_0=-\frac{L}{\Vin}\!\left(z_i-\frac{g\,z_v}{b}\right),\quad
+a_1=-\frac{L}{\Vin}\!\left(q-\frac{g\,b_1}{b}\right).}
+\label{eq:affine}
+\end{equation}
+
+\paragraph{Step 3 --- one quadratic in $s$.}
+With $x=a_0+a_1 s$ and $y=s-x=(1-a_1)s-a_0$, the product
+$x y=a_1(1-a_1)s^2+a_0(1-2a_1)s-a_0^2$. Inserting into \eqref{eq:e2} gives
+\begin{equation}
+A\,s^2+B\,s+C_c=0,\qquad
+\begin{aligned}
+A&=b\,a_1(1-a_1),\\
+B&=b\,a_0(1-2a_1)+b_1,\\
+C_c&=z_v-b\,a_0^2,
+\end{aligned}
+\label{eq:quad}
+\end{equation}
+whose solution requires a \emph{single} square root:
+\begin{equation}
+s=\frac{-B\pm\sqrt{B^2-4A\,C_c}}{2A},\qquad
+\Ton=a_0+a_1 s,\qquad \Toff=s-\Ton .
+\label{eq:sol}
+\end{equation}
+The root ($+$ or $-$) is chosen as the physical one giving $\Ton>0$ and
+$\Toff>0$. If the discriminant is negative, or $A=b=0$, no valid single--shot
+solution exists and no pulse is issued.
+
+\medskip
+\noindent\textit{Note.} The paper's boxed closed form does not satisfy
+\eqref{eq:e1}--\eqref{eq:e2}; \eqref{eq:affine}--\eqref{eq:sol} is the re--derived
+form actually implemented, and it matches a Newton solve of
+\eqref{eq:e1}--\eqref{eq:e2} to floating--point precision.
+
+\section{As implemented: \texttt{buck\_optimal\_onoff()}}
+\begin{lstlisting}[language=C]
+q  = th*zi/2 - zv/(2L) - m2 - th*Ihat;
+g  = 0.25*(th*th - 1/(L*C))*zi - th*zv/(4L) + th*(m1+m2)/2;
+b  = th*zi/(4C) - zv/(4L*C) + (m1+m2)/(2C);      b1 = zi/(2C);
+a0 = -(L/Vin)*(zi - g*zv/b);   a1 = -(L/Vin)*(q - g*b1/b);
+A  = b*a1*(1-a1);   B = b*a0*(1-2*a1) + b1;   Cc = zv - b*a0*a0;
+disc = B*B - 4*A*Cc;                 // < 0  -> no solution
+s  = ((+/-)sqrt(disc) - B)/(2A);     // pick root with Ton>0, Toff>0
+Ton = a0 + a1*s;   Toff = s - Ton;   // then clamp to [tmin, *_max]
+\end{lstlisting}
+This float form is now the \emph{host reference} (\texttt{Tests/test\_optimal.c}).
+It ran in thread mode until September 2026, when the bench showed the pulse
+arriving $\sim$100\,$\mu$s after the load edge: with the armed ISR at
+$\sim$244 of 280 clocks the thread gets 15--35 clocks per period, and this
+solve needs $\sim$50 periods of that. The firmware now solves in the ISR.
+
+\section{ISR closed form (September 2026): two square roots, one cycle}\label{sec:isr}
+For a load step--up write $a=i_0-I_{\rm eq}<0$ ($i_0$ the valley at the pulse
+start, $I_{\rm eq}=\hat I+b$ the equilibrium current), $\Delta V=V_{\rm ref}-v_{\rm out}>0$,
+$m_1=(V_{\rm in}-V_{\rm ref})/L$. The terminal state is the \emph{periodic steady
+state} of the PWM converter at $I_{\rm eq}$: the valley $I_{\rm eq}-h$,
+$h=\tfrac12(V_{\rm in}-V_{\rm ref})(V_{\rm ref}/V_{\rm in})T_{\rm sw}/L$ (half the
+ripple, 2.45\,A here), so that the next period is an ordinary one and the first
+sample after the pulse sits at the same point of the ripple as every steady--state
+sample. The fall from $I_{\rm eq}+x$ down to $I_{\rm eq}-h$ sees the series drop,
+\begin{equation}
+m_2'=\frac{V_{\rm ref}+r\,i_2}{L},\qquad i_2=I_{\rm eq}+\frac{x-h}{2},
+\end{equation}
+($r$ = \texttt{g\_buck\_opt\_r\_off\_mohm}, a live tunable defaulting to the fitted
+\texttt{BUCK\_R\_MOHM}). The pulse delivers, above $I_{\rm eq}$, the ON triangle
+$(x^2-a^2)/(2m_1)$ plus the OFF area $(x^2-h^2)/(2m_2')$; equating the sum to the
+deficit $C\,\Delta V$ gives, with $m_1+m_2'\simeq V_{\rm in}/L$,
+\begin{equation}
+x^2=\frac{V_{\rm ref}+r i_2}{V_{\rm in}}\Big[\frac{2C\,(V_{\rm in}-V_{\rm ref})}{L}\,\Delta V+a^2
++\frac{(V_{\rm in}-V_{\rm ref})\,h^2}{V_{\rm ref}+r i_2}\Big],
+\qquad \Ton=\frac{x-a}{m_1},\qquad \Toff=\frac{(x+h)\,L}{V_{\rm ref}+r i_2}.
+\end{equation}
+The ideal--fall root $x_0$ ($r=0$, $h=0$) gives $i_2$, a second root gives $x$.
+On the plant the model assumes (series drop on both ramps, trapezoidal average)
+the pulse lands within 1.7\,mV and 2\,mA of $(V_{\rm ref},\,I_{\rm eq}-h)$
+(\texttt{Tests/test\_solve.c}). The former ideal fall $\Toff=xL/V_{\rm ref}$ was up
+to 2.4$\times$ too long at 10\,A with $r=114$\,m$\Omega$: on the bench every pulse
+swung the current far below the load and the adaptation ran to its bounds. Applied as in Section~\ref{sec:applied}: the
+excursion is capped so that $I_{\rm new}+x_{\rm app}\le I_{\rm pk}^{\max}$
+(\texttt{sat}), the rise above $i_0$ is scaled by $\gamma_{\rm on}$ and $\Ton$ is
+obtained from the resulting peak by the \emph{same} trapezoidal inversion the
+current loop uses every cycle, $\Ton=L\,(I_{\rm pk}-i_L)/(V_L-r(i_L+I_{\rm pk})/2)$
+(\texttt{buck\_cm\_ton\_raw}, one bounded UDIV), so the pulse peak lands where
+the estimator predicts it, and $\Toff=\gamma_{\rm off}\,x_{\rm app}L/V_{\rm ref}$
+(Section~\ref{sec:jac}); then the time clamps and the stretched--period floor of
+(c)--(d). The terminal current reported to the reseed is the applied peak minus
+what the final off--time removes, clamps and floor included.
+
+\paragraph{Fixed point.} Currents in Q8\,A inside the solve ($a^2\le(32\,{\rm A})^2$
+fits Q16\,A$^2$), $\Delta V$ clamped to 2047 counts so the first product stays below
+$2^{31}$, the factors $V/V_{\rm in}$ applied as Q32 high--word multiplies
+(\texttt{UMULL}), the $h^2$ term and $\Toff$ by bounded \texttt{UDIV}s. The roots are \texttt{buck\_isqrt32}: normalise $v\to v\,2^{2e}\in[2^{30},2^{32})$
+with \texttt{CLZ}, read $\sqrt{i\,2^{24}}$ and its slope ($i=64..255$, one 32--bit word
+each, 192 entries filled at start--up) and interpolate linearly, then shift back by
+$e$: $\sim$18 clocks, within 1\,LSB of $\lfloor\sqrt v\rfloor$ over the 32--bit
+range. The coefficients that depend on $V_{\rm ref}$ and $k$ are converted once by
+the thread (\texttt{buck\_so\_coef\_from\_float}, struct \texttt{g\_buck.so}).
+
+\paragraph{Timing (measured on the NUCLEO).} The ISR is entered 134--142
+clocks into the switching period (ADC trigger at 600 ticks, trigger resync,
+12.5-cycle conversion at 56\,MHz, EOC resync, exception entry), and the HRTIM
+preload window closes at 264 clocks; the solve takes 172 clocks on silicon.
+The pulse is therefore pipelined: trigger sample in period $n$ (end of the
+hot path; it clears the hot path's \texttt{running} flag), solve in $n+1$ through
+the existing cold entry (no HRTIM write, no deadline; the solve is done for
+the state at the $n+3$ rollover: valley two periods ahead with the frozen
+duty, droop plus $(I_{\rm new}-i_{\rm avg})\,2T/C$), \texttt{PER}/\texttt{CMP1}
+written first thing in $n+2$ (measured 152--198 clocks into the period, 66--112
+clocks before the deadline), stretched period $n+3$. Three switching periods
+(5\,$\mu$s) from the trigger sample, against $\sim$53 with the thread solve.
+The every--cycle path is unchanged (244 clocks, static count).
+
+\section{Dual correction on the measured terminal state (manuscript Sec.~V)}\label{sec:jac}
+The applied pulse is $\mathbf t_a=\boldsymbol\Gamma\,\mathbf t^\star$,
+$\boldsymbol\Gamma=\mathrm{diag}(\gamma_{\rm on},\gamma_{\rm off})$ (eq.~40 of
+the manuscript): $\gamma_{\rm on}$ scales the physical on--time, i.e.\ the rise
+above the pulse--start current $i_0$, $\gamma_{\rm off}$ the off--time. The
+closed form (Section~\ref{sec:isr}) aims at the periodic steady state
+$(I_{\rm eq}-h,\,V_{\rm ref})$, $I_{\rm eq}=\hat I+b$ the load measured one period
+after the edge plus a learned correction $b$.
+
+Since the inductor current is sensed, the terminal state of the pulse is
+\emph{observed}, at the first sample after the stretched period (600 ticks into
+the first normal period, before the PI has changed anything):
+\begin{align}
+z_{v,f}&=v_s-V_{\rm ref}-R_{\rm ESR}\,(i_s-I_{\rm settled}),\\
+z_{i,f}&=(i_s-m_1t_s)-(I_{\rm eq}-h),
+\end{align}
+where $v_s$, $i_s$ are the sampled voltage and current, $m_1t_s$ the rise from
+the valley to the sample instant (0.96\,A at 61\,ns), and $I_{\rm eq}-h$ the target
+valley. The equilibrium itself is checked when the linear--controller transition
+ends (192 cycles, Section~\ref{sec:reseed}):
+\begin{equation}
+e_b=I_{\rm settled}-I_{\rm eq},
+\end{equation}
+$I_{\rm settled}$ the low--passed eq.~7 estimate at that moment ($\pm0.15$\,A,
+against $\pm0.5$\,A for the former one--period window). Three residuals, three
+parameters, one thread event per pulse. With the terminal map from the pulse
+start,
+\begin{align}
+z_{i,f}&=z_{i0}+m_1\Ton-m_2\Toff,\\
+z_{v,f}&=z_{v0}+\tfrac1C\big[z_{i0}(\Ton+\Toff)+\tfrac{m_1}{2}\Ton^2+m_1\Ton\Toff-\tfrac{m_2}{2}\Toff^2\big],
+\end{align}
+$m_2=(V_{\rm ref}+r\,i_2)/L$ the fall slope of this pulse ($i_2$ the mean current
+of the fall), the Jacobian at the applied times is
+\begin{equation}
+\mathbf J=\begin{bmatrix} m_1 & -m_2\\[2pt]
+\dfrac{z_{i0}+m_1(\Ton+\Toff)}{C} & \dfrac{z_{i0}+m_1\Ton-m_2\Toff}{C}\end{bmatrix},
+\end{equation}
+and the \emph{timing} correction is the manuscript's Newton step (eqs.~43--48)
+on the full measured residual,
+\begin{equation}
+\boldsymbol\gamma^{+}=\Pi_\Gamma\!\left[\boldsymbol\gamma-\mu\,\mathrm{diag}(\mathbf t^\star)^{-1}\mathbf J^{-1}\begin{bmatrix}z_{i,f}\\ z_{v,f}\end{bmatrix}\right],
+\qquad \mu=0.25,\quad \Gamma=[0.5,\,2.0],
+\end{equation}
+with at most $0.25$ of change per pulse and $\det\mathbf J$ floored at
+$m_2\cdot0.5\,{\rm A}/C$. A clamped on--time (peak limit or $\Ton^{\max}$) cannot
+move the delivered charge: $\Toff$ alone then takes $\Delta\Toff=\mu\,z_{i,f}/m_2$
+(the voltage residual is unreachable). The \emph{equilibrium} correction is
+\begin{equation}
+b^{+}=b+\mu_b\,e_b,\qquad \mu_b=0.5,\quad |b|\le 3\,{\rm A}.
+\end{equation}
+The residuals are separable: a wrong equilibrium moves $e_b$ and not the
+terminal residuals (the pulse still lands on its target), a wrong $L$, $C$ or $r$
+moves the terminal residuals. \emph{Validity:} $z_{i,f}$, $z_{v,f}$, $e_b$ are
+clipped to $\pm2$\,A / $\pm40$ counts before use, and a residual beyond $\pm6$\,A /
+$\pm200$ counts, or a trigger on a droop beyond 200 counts, marks the record as
+corrupted: that pulse teaches nothing. (On the bench, 25 September 2026, the
+voltage sample read zero counts; the previous clip--only rule fired a pulse on
+every unmasked cycle and ran both learners to their bounds.) Host test
+(\texttt{Tests/test\_solve.c}, the learners fed with the plant's actual terminal
+current and true load): a matched plant leaves $\gamma=1$, $b=0$; a 0.6\,A load
+bias is found by $b$ with $\gamma$ untouched; $L$, $C$ and $r$ mismatches are
+absorbed within 21 pulses (the contraction per pulse is $\mu$ times the
+plant--to--model fall--slope ratio); a peak--clamped pulse has its current
+residual nulled by $\Toff$ alone.
+
+\paragraph{Post--pulse operating point (reseed).}\label{sec:reseed} With the
+current measured the voltage loop's reference is real amperes: after the pulse it
+is reseeded to $I_{\rm eq}$ itself and the current loop to the duty that holds it,
+$d_{\rm trig}+rT_{\rm sw}(I_{\rm eq}-\bar i_{\rm trig})/V_{\rm in}$ (the fitted $r$ is
+the DC duty--to--current relation), both precomputed in the write cycle. The
+trigger is then masked for 192 cycles (320\,$\mu$s, the linear--controller
+transition of manuscript Sec.~VI) while the PI owns the recovery; when the mask
+ends the settled load closes the transient's record ($e_b$ above) and the thread
+runs the dual correction. Without that mask a wrong reseed rings the loop, the
+ring's undershoot re--triggers and the loop limit--cycles (simulation: 19 pulses
+and a 1.2\,V overshoot on a 1$\to$6\,A step with a 15\,m$\Omega$ plant). Each
+transient writes one of two alternating records (trigger sample, solve inputs
+and outputs, reseed, terminal sample, settled load): no field the thread reads is
+ever live.
+
+\paragraph{Measured current (average current mode).} Since the fourth revision
+the inductor current is sensed (1\,m$\Omega$ $\times$ 40 on A1, converted by ADC2 at the
+same instant as the voltage): the inner loop is an average--current PI, the load
+estimate is eq.~7 of the manuscript on the measured period average
+($\bar i_L=i_{\rm sample}+(V_{\rm in}-V_{\rm ref})/L\,(\Ton/2-t_s)$, $t_s$ the sample's
+position on the on--ramp), $i_0$ is the measured valley extrapolated two periods
+with the measured drift and $\hat I$ the load measured over the period after the
+edge. The Pad\'e recursion no longer runs in the ISR.
+
+\paragraph{Capacitor ESR.} The ADC sample is $v_C+R_{\rm ESR}\,(i_L-I_{\rm load})$ at
+the sample instant (on the bench: a $+80$--$100$\,mV spike during the pulse at
+$\sim$7.6\,A of capacitor current, i.e.\ 10--15\,m$\Omega$). Two corrections use the
+\emph{measured} sample current: the solve refills
+$\Delta V=V_{\rm ref}-v_s+R_{\rm ESR}\,(i_s-\hat I)$ rather than the raw error
+(during a droop the inductor lags the load, so the sample sits below the
+capacitor by that much: 30 counts for a 2\,A lag at 12\,m$\Omega$, more than half
+the droop of a 3\,A step), and the terminal--voltage residual is corrected against
+the settled load as above. $R_{\rm ESR}$ is a live tunable
+(\texttt{g\_buck\_opt\_esr\_mohm}) measured on the scope as the spike during the
+pulse divided by $I_{\rm pk}-I_{\rm load}$; the former in--loop identification read
+60--75\,\% of the truth and is gone.
+
+\section{Applied $\Ton/\Toff$: gain, peak--current limit, clamps}\label{sec:applied}
+The solver output $(\Ton^\star,\Toff^\star)$ is post--processed in
+\texttt{buck\_optimal\_service()} before being written to the HRTIM:
+
+\subsection*{(a) Timing gains}
+The excursion $x$ of the closed form is capped at the peak limit
+($x_{\rm app}\le I_{\rm pk}^{\max}-I_{\rm new}$, flag \texttt{sat}); the applied rise
+above $i_0$ is $\gamma_{\rm on}(I_{\rm new}+x_{\rm app}-i_0)$, re--capped at the
+peak limit, and the on--time is its trapezoidal inversion,
+\begin{equation}
+\Ton'=\frac{L\,(I_{\rm pk,a}-i_0)}{V_L-r\,(i_0+I_{\rm pk,a})/2},\qquad
+\Toff'=\gamma_{\rm off}\,\frac{x_{\rm app}}{m_2},
+\end{equation}
+with $\gamma_{\rm on},\gamma_{\rm off}$ from Section~\ref{sec:jac} (1 at boot).
+The former learned gain $k$ (excursion scaling with an empirical secant on the
+first post--pulse sample) is gone: its residual depended on the trigger timing,
+not on $k$.
+
+\subsection*{(b) Peak--current--mode limit (control, not protection)}
+The on--time is capped so the predicted peak inductor current stays at a
+configured limit $\Ipk$ (\texttt{BUCK\_OPT\_IPK\_MAX\_A}). With the estimator's
+inductor current $i_L$ at the step as the ramp start,
+\begin{equation}
+I_{\mathrm{peak}}=i_L+\frac{\Vin-\Vout}{L}\,\Ton\le \Ipk
+\;\Longrightarrow\;
+\Ton\le \Ton^{\Ipk}=\frac{(\Ipk-i_L)\,L}{\Vin-\Vout}.
+\end{equation}
+This is the normally binding limit; it only shortens $\Ton$ and never trips a
+fault (over--current \emph{protection} is external to the loop).
+
+\subsection*{(c) Time clamp and quantization}
+Finally
+\begin{equation}
+\Ton^{\mathrm{app}}=\min\!\bigl(\Ton',\,\Ton^{\Ipk},\,\Ton^{\max}\bigr),\ \ge t_{\min},
+\qquad
+\Toff^{\mathrm{app}}=\max\!\bigl(\Toff',\,t_{\min}\bigr),
+\end{equation}
+where $\Ton^{\max}<\Tsw$ is required so that the compare write $\texttt{CMP1}=\Ton$
+is a valid compare against the (still active) one--period register. If either the
+peak or time clamp binds, a saturation flag excludes $\gamma_{\rm on}$ from the
+adaptation of that pulse. The
+seconds values are quantized to HRTIM ticks,
+\begin{equation}
+n_{\mathrm{on}}=\Bigl\lfloor \Ton^{\mathrm{app}}/T_{\mathrm{tick}}+\tfrac12\Bigr\rfloor,\qquad
+n_{\mathrm{off}}=\Bigl\lfloor \Toff^{\mathrm{app}}/T_{\mathrm{tick}}+\tfrac12\Bigr\rfloor,
+\end{equation}
+and applied for one stretched period as $\texttt{PER}=n_{\mathrm{on}}+n_{\mathrm{off}}$,
+$\texttt{CMP1}=n_{\mathrm{on}}$ (high side ON for $n_{\mathrm{on}}$, OFF for the
+remainder).
+
+\subsection*{(d) Stretched--period floor}
+The ISR that restores the normal PWM runs at a \emph{fixed} point of the
+stretched period (ADC trigger at \texttt{CMP3} plus conversion and interrupt
+entry, roughly $4.5$--$5.3\times10^3$ ticks in). A stretched period shorter than
+that would end before the restore is written, the short pulse would repeat and
+the deadline check would trip. The firmware therefore enforces
+\begin{equation}
+n_{\mathrm{on}}+n_{\mathrm{off}}\;\ge\;N_{\min}
+=\texttt{BUCK\_OPT\_PER\_MIN\_TICKS}=\texttt{BUCK\_HRTIM\_PERIOD},
+\qquad n_{\mathrm{off}}\leftarrow N_{\min}-n_{\mathrm{on}}\ \text{if needed},
+\end{equation}
+i.e.\ the large--signal period is never shorter than a normal one, so every ISR
+timing assumption of a normal cycle holds inside it. With $k=1$ the solver's
+$\Ton^\star+\Toff^\star$ is $2$--$4\,\mu$s for realistic captured states and the
+floor does not bind; it binds only when $\gamma_{\rm off}$ has shrunk $\Toff$.
+
+\subsection*{(e) Trigger}
+The state--anchored trigger that starts a transient acts on the output--capacitor
+state, both inputs in ADC counts: $z_v=v_s-V_{\rm ref}$ and $d_v=v_s(n)-v_s(n-1)$,
+the one--period change ($C\,dv/dt$ is the capacitor current $i_L-I_{\rm load}$: the
+load step itself, before the current loop has moved the inductor; 1\,A is 8 counts
+per period). With the inductor current regulated, the former current--displacement
+axis only reported the current loop. Fire when
+$S=(z_v/V_a)^2+(d_v/dV_a)^2+2\rho\,(z_v/V_a)(d_v/dV_a)>1$ with $z_v<0$ and $d_v\le0$
+(below the reference and not recovering: the only signature the step--up solver
+can act on). $S$ is evaluated inside the ISR in integer arithmetic by completing
+the square, $S=u^2+w^2$ with $u=n_v+\rho n_d$, $w=\sqrt{1-\rho^2}\,n_d$ ($n_v=z_v/V_a$,
+$n_d=d_v/dV_a$ in Q14, compared against $2^{28}$), only for samples that pass the
+two sign tests. $V_a$ (25 counts), $dV_a$ (16 counts per period), $\rho$ remain
+run--time float tunables; the thread converts them into the ISR's integer
+coefficients whenever they change. A fast 3\,A step scores 2.25 in its first period;
+a 15--40\,$\mu$s slew fires on the level, two thirds of the way down the dip the
+current--mode PI leaves on its own; $\pm6$ counts of noise on both samples score
+0.6 (simulation: $\pm8$ counts false--trigger on the slope axis, so $dV_a$ is set
+from the steady--state score of the candidate samples, which the panel shows). A feedback sample that jumps more than 256 counts in one period is
+held off for that cycle (two consecutive such samples are accepted), and a sample
+below a quarter of the reference for 500\,$\mu$s trips the feedback--lost fault.
+
+\paragraph{Model scale and dead time.} $V_{\rm ref}$ and every voltage derived
+from the ADC use the \emph{measured} scale, 793\,$\mu$V per count (scope mean
+792.6\,mV at the 1000--count setpoint; an assumed 1\,mV per count made every
+model voltage 26\,\% too large, so the pulse refilled a 26\,\% larger deficit
+with a 26\,\% too steep off--ramp and ended $\sim$1.3\,A above the load). The
+inductor sees the CMP1 on--time minus the 50\,ns rising dead time (272 ticks) in
+the estimator table, the current--loop inversion and the pulse solve.
+
+\section{Parameters}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Symbol & Macro & Value \\
+\midrule
+$\Vin$ & \texttt{BUCK\_VIN\_V} & $6.0$ V\\
+$\Vref$ & \texttt{BUCK\_VOUT\_MV} & $0.793$ V (measured)\\
+$L$ & \texttt{BUCK\_L\_H} & $330$ nH\\
+$C$ & \texttt{BUCK\_C\_F} & $260\,\mu$F\\
+$r$ & \texttt{BUCK\_R\_MOHM} & $114$ m$\Omega$\\
+$t_{\min}$ & \texttt{BUCK\_OPT\_TMIN\_S} & $100$ ns\\
+$\Ton^{\max}$ & \texttt{BUCK\_OPT\_TON\_MAX\_S} & $1.5\,\mu$s ($<\Tsw=1.667\,\mu$s)\\
+$\Toff^{\max}$ & \texttt{BUCK\_OPT\_TOFF\_MAX\_S} & $6\,\mu$s\\
+$\Ipk$ & \texttt{BUCK\_OPT\_IPK\_MAX\_A} & $10$ A\\
+$\mu$, $\Gamma$ & \texttt{BUCK\_OPT\_GAMMA\_*} & $0.25$, $[0.5,2.0]$\\
+$\mu_b$, $|b|_{\max}$ & \texttt{BUCK\_OPT\_IEQ\_*} & $0.5$, $3$ A\\
+$T_{\mathrm{tick}}$ & $\Tsw/\text{PERIOD}$ & $1.667\,\mu\text{s}/8960$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

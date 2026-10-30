@@ -350,9 +350,10 @@ _Static_assert(BUCK_TOC_CMP2_BACKSTOP > BUCK_CMP_MAX + BUCK_DT_TICKS + 96U && BU
 
 /* ---- TOC learning: the Jacobian step on the measured end state (stage 4) ------------------------
  * After a frame the first normal period runs at the held duty (the duty that holds I_eq). Two
- * residuals: z_v = v_out at the frame's end - V_ref, and z_i = (C/T) (v_out after the first period -
- * v_out at the frame's end), the first period's capacitor current (its mean inductor current minus
- * the load). The gains g = {g_on, g_off} of the order take the Newton step
+ * residuals: z_v = v_out at the frame's end - V_ref, and z_i = the first period's measured mean
+ * current - I_eq, the landing (stage 4b: the voltage change over the period, (C/T)(v_1 - v_end), is the
+ * landing plus the equilibrium error I_eq - I_load; the latter is the equilibrium correction's, below).
+ * The gains g = {g_on, g_off} of the order take the Newton step
  *   [dt1; dt2] = -mu J^-1 [z_i; z_v],   g += g dt / t_applied
  * on the L-C Jacobian at the applied spans, |dg| <= STEP, g in [G_MIN, G_MAX]. A first span that was
  * clamped (the backstop limit, or the solve finished after its end) cannot move: the second span
@@ -367,5 +368,13 @@ _Static_assert(BUCK_TOC_CMP2_BACKSTOP > BUCK_CMP_MAX + BUCK_DT_TICKS + 96U && BU
 #define BUCK_TOC_ZV_CLIP_V       0.04f
 #define BUCK_TOC_ZI_SKIP_A       6.0f
 #define BUCK_TOC_ZV_SKIP_V       0.2f
+/* The equilibrium correction b (stage 4b, user; Inc/buck_toc.h buck_toc_learn_b): I_eq = the edge's
+ * per-cycle estimate + b[order], b += mu_b (I_load - I_eq) after each frame, the same CLIP/SKIP bounds as
+ * the current residual. Neither learner runs when the first period's measured mean current is below
+ * LEARN_IMIN: A1 reads a negative current as 0, so the four-sample mean reads high when the valley goes
+ * below zero (the A1 bias is +0.02 A at 1 A, Part 2's closed loop). */
+#define BUCK_TOC_B_MU            0.5f
+#define BUCK_TOC_B_MAX_A         3.0f
+#define BUCK_TOC_LEARN_IMIN_A    0.5f
 
 #endif

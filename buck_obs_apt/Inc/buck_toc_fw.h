@@ -23,7 +23,10 @@
  *        observer's v^ set to it;
  *   1    the sample after P1 (read in P2): the voltage PI's integrator = P1's measured mean current
  *        (user: no reference learner), the current PI's = the held duty, then an ordinary pass (CMP1
- *        for P3, score, observer, A2, D4); z_i = (C/T) (v_1 - v_T); the Jacobian step on the gains;
+ *        for P3, score, observer, A2, D4); the load over P1, I_load = i_P1 - (C/T)(v_1 - v_T): the
+ *        equilibrium correction b at once; the landing z_i = i_P1 - I_eq and z_v: the Jacobian step on
+ *        the gains in two parts, in the spare tails of the next one or two ordinary passes, which the TOC
+ *        code runs itself (toc_pass; the restart pass's tail is too short for the step);
  *   then the normal passes, with run_loop's state taken back from the mailbox. */
 
 #include <stdint.h>
@@ -43,6 +46,15 @@
 #endif
 #define BUCK_TOC_ALIGN_TOL      64      /* ticks: allowed change of (Timer A - master) counter read back to back */
 #define BUCK_TOC_F_EARLIEST     1024U   /* a sample after the frame: a counter below this means a period was lost */
+/* The learning after a frame (stage 4b, Src/buck_toc.c): a part of the Jacobian step (~110 clocks static) starts
+ * only with the counter below this, so that it ends by ~2048 ticks into the next period; the next pass (the TOC
+ * code's own, toc_pass: 90 clocks from its sample to its CMP1 write) then still writes CMP1 ~100 clocks before
+ * the deadline. Otherwise the next ordinary pass first, at most LEARN_PASSES of them. */
+#define BUCK_TOC_LEARN_PART_LAST (BUCK_HRTIM_PERIOD + 2048U - 32U * 110U)
+/* ... and not before this: this period's own sample (its end of conversion ~1150 ticks in) comes first, so a part
+ * never delays the pass of a sample that is about to arrive. */
+#define BUCK_TOC_LEARN_PART_FIRST 2048U
+#define BUCK_TOC_LEARN_PASSES   4U
 
 enum { BUCK_TOC_RET_STATE = 0U, BUCK_TOC_RET_EXIT = 1U };
 enum { BUCK_TOC_REQ_NONE = 0U, BUCK_TOC_REQ_FRAME = 1U, BUCK_TOC_REQ_FAIL = 2U };
@@ -80,6 +92,7 @@ typedef struct {
     /* the TOC code's own (the start reads them: one base register for all) */
     buck_toc_k_t k;             /* the solve's constants, for V_ref = k.vref (buck_toc_prime, buck_toc_finish) */
     float g1[2], g2[2];         /* the gains in use by order and span (g_buck.toc.g checked) */
+    float b[2];                 /* the equilibrium corrections in use by order (g_buck.toc.b checked) */
     buck_toc_frame_t f;
 } buck_toc_mb_t;
 

@@ -80,7 +80,7 @@ BUCK_INLINE void buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck
     /* the L-C solve's first span (Inc/buck_toc.h) from the pass's measured average and v_out, while the
      * span runs (in registers: into the record only at the end), clamped to the limit */
     buck_toc_sol_t sol;
-    buck_toc_solve1(&m->k, order, v, m->v_prev, im, &sol);
+    buck_toc_solve1(&m->k, order, v, m->v_prev, im, m->b[order], &sol);
     const float g1 = m->g1[order];
     uint32_t t1 = buck_toc_ticks(sol.t1 * g1), sat = 0U;
     if (__builtin_expect(t1 > lim, 0)) { t1 = lim; sat = BUCK_TOC_SAT_LIMIT1; }

@@ -54,9 +54,11 @@ typedef struct {
     /* tunables, written by the debugger */
     uint32_t toc_enable;        /* 1: a rising score edge (g 0 -> 1) in a HOLD pass starts a TOC (taken up at the
                                    next telemetry pass, every 64 passes) */
-    uint32_t learn_enable;      /* 1: the Jacobian step on g after each frame */
+    uint32_t learn_enable;      /* 1: the Jacobian step on g and the equilibrium correction b after each frame */
     float g[2][2];              /* timing gains, g[order] = {g_on, g_off} (order 0 ON-OFF, 1 OFF-ON); writable,
                                    a value outside [BUCK_TOC_G_MIN, BUCK_TOC_G_MAX] is used as 1 */
+    float b[2];                 /* equilibrium correction by order, A (stage 4b): I_eq = the edge's estimate + b;
+                                   writable, outside [-BUCK_TOC_B_MAX_A, BUCK_TOC_B_MAX_A] used as 0 */
     /* counts */
     uint32_t state;             /* BUCK_TOCS_*: where the last episode is / ended */
     uint32_t edges;             /* score edges that reached the TOC code */
@@ -64,6 +66,9 @@ typedef struct {
     uint32_t rej[BUCK_TOCR_N];
     uint32_t learn_n;           /* Jacobian steps taken */
     uint32_t learn_skip;        /* frames whose residuals were beyond the SKIP bounds (or learning off) */
+    uint32_t b_n;               /* equilibrium corrections taken */
+    uint32_t learn_low;         /* frames not learned from: the first period's mean current below LEARN_IMIN */
+    uint32_t learn_late;        /* Jacobian steps dropped: not done within BUCK_TOC_LEARN_PASSES passes */
     /* the last frame */
     uint32_t order;             /* 0 ON-OFF, 1 OFF-ON */
     uint32_t sat;               /* BUCK_TOC_SAT_* */
@@ -76,8 +81,11 @@ typedef struct {
     float t1_model, t2_model;   /* the solve's spans before gains and clamps, ticks */
     float v_mid;                /* the period's own A0 pair, converted inside the frame (dropped), V */
     float v_end, z_v;           /* the sample at the frame's end and z_v = v_end - V_ref (V) */
-    float v_1, z_i;             /* the sample after the first period and z_i = (C/T)(v_1 - v_end) (A) */
-    float i_first;              /* the first period's measured mean current: the voltage PI's new integrator (A) */
+    float v_1;                  /* the sample after the first period, V */
+    float i_first;              /* the first period's measured mean current i_P1: the voltage PI's new integrator (A) */
+    float z_i;                  /* the landing i_P1 - I_eq (A): the timing's current residual */
+    float i_load;               /* the load over the first period, i_P1 - (C/T)(v_1 - v_end) (A) */
+    float e_b;                  /* the equilibrium residual I_load - I_eq (A): b's */
     /* hardware checks (RM0440 items not confirmed by the manual; README bench tests) */
     uint32_t chk_commit;        /* the frame's end transfer not seen (MUPD / UPD) */
     uint32_t chk_align;         /* master and Timer A counters drifted apart */

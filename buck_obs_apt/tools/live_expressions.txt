@@ -72,6 +72,12 @@ g_buck.toc.v_end
 g_buck.toc.z_v
 g_buck.toc.v_1
 g_buck.toc.z_i
+g_buck.toc.i_load
+g_buck.toc.e_b
+g_buck.toc.b
+g_buck.toc.b_n
+g_buck.toc.learn_low
+g_buck.toc.learn_late
 g_buck.toc.i_first
 g_buck.toc.chk_commit
 g_buck.toc.chk_align

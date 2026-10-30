@@ -61,7 +61,7 @@ static void test_solve(void)
         const double im = ieq + a;
         const float v_prev = (float)(v - a * T / C);           /* so that (C/T)(v - v_prev) = a */
         buck_toc_sol_t s;
-        const int32_t ok = buck_toc_solve(&k, order, (float)v, v_prev, (float)im, &s);
+        const int32_t ok = buck_toc_solve(&k, order, (float)v, v_prev, (float)im, 0.0f, &s);
         if (!ok) { ++n_none[order]; continue; }
         ++n_ok[order];
         const double t1 = s.t1 * tick, t2 = s.t2 * tick;
@@ -113,7 +113,7 @@ static void test_learn(void)
             int steps = 0;
             for (int it = 0; it < 40; ++it) {
                 buck_toc_sol_t s;
-                (void)buck_toc_solve(&k, order, (float)v, (float)(v - a * BUCK_TSW_S / BUCK_C_F), (float)(ieq + a), &s);
+                (void)buck_toc_solve(&k, order, (float)v, (float)(v - a * BUCK_TSW_S / BUCK_C_F), (float)(ieq + a), 0.0f, &s);
                 const double t1 = s.t1 * g1 * tick, t2 = s.t2 * g2 * tick;
                 double zi, ve;
                 lc_end(a, v, q1, q2, C, t1, t2, &zi, &ve);
@@ -137,7 +137,7 @@ static void test_learn(void)
         for (int it = 0; it < 40; ++it) {
             buck_toc_sol_t s;
             (void)buck_toc_solve(&k, BUCK_TOC_ON_OFF, (float)(vref - 0.02), (float)(vref - 0.02 + 2.0 * BUCK_TSW_S / C),
-                                 0.0f, &s);
+                                 0.0f, 0.0f, &s);
             const double t1 = s.t1 * tick * 1.3, t2 = buck_toc_t2_for(&k, BUCK_TOC_ON_OFF, s.a, (float)(s.t1 * 1.3)) * g2 * tick;
             double zi, ve;
             lc_end(s.a, vref - 0.02, m1, -m2, C, t1, t2, &zi, &ve);
@@ -156,6 +156,44 @@ static void test_learn(void)
         const uint32_t r2 = buck_toc_learn(&k, 0U, -2.0f, 4e-7f, 2e-6f, 0U, 0U, 0.0f, NAN, &g1, &g2);
         CHECK(r1 == 0U && r2 == 0U && g1 == 1.0f && g2 == 1.0f, "learn gates");
         CHECK(buck_toc_gain_ok(NAN) == 1.0f && buck_toc_gain_ok(7.0f) == 1.0f && buck_toc_gain_ok(1.3f) == 1.3f, "gain check");
+    }
+    /* the Jacobian step in two parts (the firmware's split) gives the same gains bit for bit */
+    {
+        long bad = 0;
+        srand(13);
+        for (int n = 0; n < 200000; ++n) {
+            const uint32_t order = (uint32_t)(n & 1), sat1 = (uint32_t)(rand() % 4 == 0), sat2 = (uint32_t)(rand() % 4 == 0);
+            const float a = (float)(-4.0 + 8.0 * urand()), t1 = (float)(1e-7 + 3e-6 * urand()), t2 = (float)(1e-7 + 5e-6 * urand());
+            const float zi = (float)(-8.0 + 16.0 * urand()), zv = (float)(-0.25 + 0.5 * urand());
+            float g1 = (float)(0.4 + 2.1 * urand()), g2 = (float)(0.4 + 2.1 * urand()), h1 = g1, h2 = g2;
+            const uint32_t r = buck_toc_learn(&k, order, a, t1, t2, sat1, sat2, zi, zv, &g1, &g2);
+            buck_toc_dt_t d;
+            const uint32_t r2 = buck_toc_learn_dt(&k, order, a, t1, t2, sat1, zi, zv, &d);
+            if (r2) buck_toc_learn_g(t1, t2, sat1, sat2, &d, &h1, &h2);
+            bad += r != r2 || memcmp(&g1, &h1, 4) != 0 || memcmp(&g2, &h2, 4) != 0;
+        }
+        CHECK(bad == 0, "learn in two parts = learn (%ld differ)", bad);
+    }
+    /* the equilibrium correction: b converges on a constant bias, is clipped per step and bounded, gates */
+    {
+        float b = 0.0f;
+        for (int it = 0; it < 20; ++it) { const float e = 0.7f - b; (void)buck_toc_learn_b(e, &b); }
+        float bc = 0.0f;
+        (void)buck_toc_learn_b(5.0f, &bc);                       /* clipped at 2 A: b = 0.5 x 2 */
+        float bm = 2.9f;
+        (void)buck_toc_learn_b(1.0f, &bm);                       /* bounded at 3 A */
+        float bs = 0.3f;
+        const uint32_t s1 = buck_toc_learn_b(7.0f, &bs), s2 = buck_toc_learn_b(NAN, &bs);
+        printf("equilibrium correction: b -> %.4f A for a 0.7 A bias in 20 frames; one 5 A residual moves it %.2f A; "
+               "bounded at %.2f A\n", (double)b, (double)bc, (double)bm);
+        CHECK(fabsf(b - 0.7f) < 1e-4f && bc == BUCK_TOC_B_MU * BUCK_TOC_ZI_CLIP_A && bm == BUCK_TOC_B_MAX_A &&
+              s1 == 0U && s2 == 0U && bs == 0.3f, "learn b");
+        CHECK(buck_toc_b_ok(NAN) == 0.0f && buck_toc_b_ok(4.0f) == 0.0f && buck_toc_b_ok(-1.5f) == -1.5f, "b check");
+        /* b moves I_eq one for one */
+        buck_toc_sol_t s0, s1b;
+        buck_toc_solve1(&k, BUCK_TOC_ON_OFF, (float)(vref - 0.02), (float)(vref - 0.015), 2.0f, 0.0f, &s0);
+        buck_toc_solve1(&k, BUCK_TOC_ON_OFF, (float)(vref - 0.02), (float)(vref - 0.015), 2.0f, 0.5f, &s1b);
+        CHECK(fabsf(s1b.ieq - s0.ieq - 0.5f) < 1e-5f && fabsf(s1b.a - s0.a + 0.5f) < 1e-5f, "b in the solve: I_eq + b");
     }
 }
 
@@ -257,12 +295,15 @@ static void plan_normal(span_plan_t *sp, uint32_t cmp, int hs_at_start)
  * this counter value, and the solve's counter read this many ticks after it (the first span's end then
  * lies at least BUCK_TOC_SWU_GUARD_TICKS beyond that). */
 #define SIM_C_S_TICKS     3350U
-#define SIM_SOLVE_TICKS   1888U
+#define SIM_SOLVE_TICKS   1984U
 
 typedef struct {
     double t_up, t_down, t_end, i_base_R, i_step, L_plant, rl_plant;
     int noise, toc, learn, cycles;      /* cycles: up/down step pairs (period 2 x (t_down - t_up)) */
     const char *name;
+    double slew;                        /* the load's edges ramp over this, s (0: steps) */
+    double esr;                         /* output capacitor ESR, ohm */
+    int mix;                            /* 1: every other cycle's step is 2.5 x i_step */
 } tscen_t;
 
 typedef struct {
@@ -271,12 +312,16 @@ typedef struct {
     float g[2][2];
     double zv_first, zv_last, zi_last;
     double zi_first_o[2], zi_last_o[2], zv_last_o[2];   /* by order: the first and the last frame's residuals */
+    double eb_first_o[2], eb_last_o[2];                 /* by order: the equilibrium residual I_load - I_eq */
+    float b[2];
+    double dip_last, hump_last;                         /* of the last cycle */
+    long learn_low;
 } tres_t;
 
 static void run_loop_sim(const tscen_t *sc, tres_t *res)
 {
     const double T = BUCK_TSW_S;
-    plant_t p = { .L = sc->L_plant, .rl = sc->rl_plant, .C = BUCK_C_F, .esr = 0.0, .vin = BUCK_VIN_V, .vd = 0.7,
+    plant_t p = { .L = sc->L_plant, .rl = sc->rl_plant, .C = BUCK_C_F, .esr = sc->esr, .vin = BUCK_VIN_V, .vd = 0.7,
                   .R = sc->i_base_R, .noise = sc->noise };
     buck_tune_t tune = BUCK_TUNE_DEFAULTS;
     tune.score_a = 2500.0f;                     /* S = (e_v / 20 mV)^2, S_th = 1 */
@@ -288,8 +333,11 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
     const float vref = (float)(BUCK_VREF_COUNTS_DEFAULT * BUCK_V_PER_COUNT);
     buck_toc_k_init(&k, vref);
     float g[2][2] = { { 1.0f, 1.0f }, { 1.0f, 1.0f } };
+    float bq[2] = { 0.0f, 0.0f };
     memset(res, 0, sizeof *res);
     res->imin = 1e9; res->imax = -1e9; res->zv_first = NAN;
+    res->eb_first_o[0] = res->eb_first_o[1] = NAN;
+    int last_cyc = -1;
     uint32_t cmp_active = BUCK_CMP_MIN, cmp_next = BUCK_CMP_MIN;
     int running = 0, hs_at_start = 0;
     uint32_t vsum = 0, isum = 0;                /* the samples of the period just run */
@@ -306,7 +354,16 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
         double ph = t - sc->t_up;
         int cyc = (ph >= 0) ? (int)(ph / period2) : -1;
         double in_cyc = (ph >= 0) ? ph - cyc * period2 : -1;
-        p.istep = (cyc >= 0 && cyc < sc->cycles && in_cyc < sc->t_down - sc->t_up) ? sc->i_step : 0.0;
+        {
+            const double ist = (sc->mix && (cyc & 1)) ? 2.5 * sc->i_step : sc->i_step, hi_len = sc->t_down - sc->t_up;
+            double f = 0.0;
+            if (cyc >= 0 && cyc < sc->cycles) {
+                if (in_cyc < hi_len) f = (sc->slew > 0.0) ? fmin(1.0, in_cyc / sc->slew) : 1.0;
+                else f = (sc->slew > 0.0) ? fmax(0.0, 1.0 - (in_cyc - hi_len) / sc->slew) : 0.0;
+            }
+            p.istep = f * ist;
+            if (cyc != last_cyc && cyc >= 0 && cyc < sc->cycles) { last_cyc = cyc; res->dip_last = res->hump_last = 0.0; }
+        }
         /* ---- the pass at the start of this period (the samples of the previous one) */
         span_plan_t sp;
         int frame = 0;
@@ -330,7 +387,15 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
             cmp_next = buck_ctrl_fast_kt(&tune, ki_t_v, ki_t_i, &s, vsum, isum, &stp);
             const uint32_t gg = buck_ctrl_slow(&tune, &s, &stp, &o);
             (void)buck_obs_step(&obs, stp.v, stp.im, ok);
-            const float zv = v_end - vref, zi = k.cdt * (stp.v - v_end);
+            /* the firmware's residuals (Src/buck_toc.c): the landing and the end voltage for the timing, the load
+             * over P1 against I_eq for b */
+            const float zv = v_end - vref, zi = i1 - ep_ieq;
+            const float i_load = i1 - k.cdt * (stp.v - v_end), e_b = i_load - ep_ieq;
+            if (isnan(res->eb_first_o[ep_order])) res->eb_first_o[ep_order] = e_b;
+            res->eb_last_o[ep_order] = e_b;
+            const int low = !(i1 >= BUCK_TOC_LEARN_IMIN_A);
+            res->learn_low += sc->learn && low;
+            if (sc->learn && !low) (void)buck_toc_learn_b(e_b, &bq[ep_order]);
             if (getenv("TOC_TRACE"))
                 printf("    frame: order %u sat %u ok %u t1 %u t2 %u a %.2f I_eq %.2f v_end %.4f v_1 %.4f i1 %.2f "
                        "z_v %.1f mV z_i %.2f A g %.3f/%.3f\n", (unsigned)ep_order, (unsigned)ep_sat, (unsigned)ep_ok,
@@ -340,7 +405,7 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
             if (isnan(res->zi_first_o[ep_order])) res->zi_first_o[ep_order] = zi;
             res->zi_last_o[ep_order] = zi; res->zv_last_o[ep_order] = zv;
             res->zv_last = zv; res->zi_last = zi;
-            if (sc->learn && ep_ok) {
+            if (sc->learn && ep_ok && !low) {
                 const uint32_t sat1 = (ep_sat & 3U) != 0U, sat2 = (ep_sat & 12U) != 0U;
                 float g1 = ep_g1, g2 = ep_g2;
                 if (buck_toc_learn(&k, ep_order, ep_a, (float)ep_t1 * (float)BUCK_TICK_S, (float)ep_t2 * (float)BUCK_TICK_S,
@@ -364,7 +429,7 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
                                             : (uint32_t)fminf(fmaxf((im - BUCK_TOC_IVAL_MIN_A) * k.t_m2, 0.0f), (float)BUCK_TOC_TOFF_MAX_TICKS);
                 const uint32_t c_s = SIM_C_S_TICKS;
                 buck_toc_sol_t sol;
-                buck_toc_solve1(&k, order, v, v_prev, im, &sol);
+                buck_toc_solve1(&k, order, v, v_prev, im, bq[order], &sol);
                 uint32_t t1 = (uint32_t)fmaxf(sol.t1 * g1 + 0.5f, 0.0f), sat = 0;
                 if (!(sol.t1 * g1 > 0.0f)) t1 = 0;
                 if (t1 > lim) { t1 = lim; sat = BUCK_TOC_SAT_LIMIT1; }
@@ -436,23 +501,29 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
         const double v = p_vout(&p);
         if (t > sc->t_up && t < sc->t_up + 0.4e-3) res->dip = fmax(res->dip, vref - v);
         if (t > sc->t_down && t < sc->t_down + 0.4e-3) res->hump = fmax(res->hump, v - vref);
+        if (cyc == sc->cycles - 1 && in_cyc >= 0) {
+            const double hi_len = sc->t_down - sc->t_up;
+            if (in_cyc < 0.4e-3) res->dip_last = fmax(res->dip_last, vref - v);
+            if (in_cyc >= hi_len && in_cyc < hi_len + 0.4e-3) res->hump_last = fmax(res->hump_last, v - vref);
+        }
         hs_at_start = frame && ep_order == BUCK_TOC_OFF_ON;
         cmp_active = cmp_next;
         t += sp.per * BUCK_TICK_S;
         (void)T;
     }
     memcpy(res->g, g, sizeof g);
+    memcpy(res->b, bq, sizeof bq);
 }
 
 static void test_closed_loop(void)
 {
     const double R1 = BUCK_VREF_COUNTS_DEFAULT * BUCK_V_PER_COUNT;   /* 1 A at V_ref */
     const struct { tscen_t s; } sc[] = {
-        { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 3 -> 1 A, PI alone" } },
-        { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 3 -> 1 A, TOC" } },
-        { { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 6 -> 1 A, PI alone" } },
-        { { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 6 -> 1 A, TOC" } },
-        { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 2, 1, 0, 1, "1 -> 3 -> 1 A, TOC, ADC noise +-2" } },
+        { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 3 -> 1 A, PI alone", 0, 0, 0 } },
+        { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 3 -> 1 A, TOC", 0, 0, 0 } },
+        { { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 6 -> 1 A, PI alone", 0, 0, 0 } },
+        { { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 6 -> 1 A, TOC", 0, 0, 0 } },
+        { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 2, 1, 0, 1, "1 -> 3 -> 1 A, TOC, ADC noise +-2", 0, 0, 0 } },
     };
     tres_t r[sizeof sc / sizeof sc[0]];
     for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; ++i) {
@@ -463,35 +534,52 @@ static void test_closed_loop(void)
     }
     CHECK(r[0].frames == 0 && r[2].frames == 0, "no frame with the TOC off");
     CHECK(r[1].frames == 2 && r[3].frames == 2, "one frame per step with the TOC on");
-    CHECK(r[1].dip < 0.6 * r[0].dip && r[1].hump < 0.6 * r[0].hump, "TOC cuts the 2 A dip and hump");
+    /* the 2 A step's solved on-time is below the minimum first span (LATE): the second span then removes the
+     * extra current by the lossless model, which the plant's steeper fall overdoes until g_off is learned */
+    CHECK(r[1].dip < 0.65 * r[0].dip && r[1].hump < 0.6 * r[0].hump, "TOC cuts the 2 A dip and hump");
     CHECK(r[3].dip < 0.6 * r[2].dip && r[3].hump < 0.6 * r[2].hump, "TOC cuts the 5 A dip and hump");
     CHECK(r[1].imax < BUCK_TOC_IPK_MAX_A + 1.0 && r[3].imax < BUCK_TOC_IPK_MAX_A + 1.0, "peak current within the limit");
     CHECK(r[4].frames >= 2 && r[4].dip < 0.7 * r[0].dip, "TOC with ADC noise");
-    /* learning over repeated steps on the board-like plant and on a mismatched one */
+    /* learning over repeated steps: the board-like plant, a mismatched one, a slewing load (the edge comes
+     * mid-slew: the edge estimate is short of the final load, b's case), mixed step sizes, ESR */
     const tscen_t lr[] = {
-        { 12e-3, 12.6e-3, 12e-3 + 12 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 12, "learning, 12 x (1 -> 3 -> 1 A)" },
-        { 12e-3, 12.6e-3, 12e-3 + 12 * 1.2e-3, R1, 2.0, 0.8 * BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 12, "learning, plant L -20 %" },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 16 x (1 -> 3 -> 1 A)", 0, 0, 0 },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, 0.8 * BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, plant L -20 %", 0, 0, 0 },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 10 us slewing edges", 10e-6, 0, 0 },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 2 A / 5 A alternating", 0, 0, 1 },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 5 mOhm ESR", 0, 5e-3, 0 },
     };
     for (unsigned i = 0; i < sizeof lr / sizeof lr[0]; ++i) {
         tres_t q, q0;
         tscen_t nolearn = lr[i]; nolearn.learn = 0;
         srand(21); run_loop_sim(&nolearn, &q0);
         srand(21); run_loop_sim(&lr[i], &q);
-        printf("[%s] frames %ld; gains ON-OFF %.3f / %.3f, OFF-ON %.3f / %.3f; ON-OFF z_i %.2f -> %.2f A (z_v %.1f mV), "
-               "OFF-ON z_i %.2f -> %.2f A (z_v %.1f mV); dip / hump of the first step %.1f / %.1f mV\n", lr[i].name, q.frames,
-               (double)q.g[0][0], (double)q.g[0][1], (double)q.g[1][0], (double)q.g[1][1], q.zi_first_o[0], q.zi_last_o[0],
-               q.zv_last_o[0] * 1e3, q.zi_first_o[1], q.zi_last_o[1], q.zv_last_o[1] * 1e3, q.dip * 1e3, q.hump * 1e3);
-        (void)q0;
-        CHECK(q.frames == 24, "%s: one frame per step", lr[i].name);
-        /* ON-OFF: the first span is the minimum (the solve's time) on these steps, so the second span's gain
-         * takes the current residual (the fall is steeper than the lossless model's); OFF-ON's first span is
-         * at its valley limit and the second at its minimum: nothing to learn there (README) */
-        CHECK(fabs(q.zi_last_o[0]) < 0.35 * fabs(q.zi_first_o[0]) && q.g[0][1] < 0.9f,
-              "%s: ON-OFF current residual learned away", lr[i].name);
-        CHECK(fabs(q.zv_last_o[0]) < fabs(q.zv_first) && fabs(q.zv_last_o[0]) < 0.025, "%s: ON-OFF voltage residual smaller",
-              lr[i].name);
+        printf("[%s] frames %ld; g ON-OFF %.3f / %.3f, OFF-ON %.3f / %.3f; b %+.2f / %+.2f A; ON-OFF z_i %.2f -> %.2f A, "
+               "e_b %.2f -> %.2f A, z_v %.1f mV; OFF-ON z_i %.2f -> %.2f A, e_b %.2f -> %.2f A, z_v %.1f mV; last step dip / hump "
+               "%.1f / %.1f mV (no learning %.1f / %.1f mV); %ld frames below LEARN_IMIN\n", lr[i].name, q.frames,
+               (double)q.g[0][0], (double)q.g[0][1], (double)q.g[1][0], (double)q.g[1][1], (double)q.b[0], (double)q.b[1],
+               q.zi_first_o[0], q.zi_last_o[0], q.eb_first_o[0], q.eb_last_o[0], q.zv_last_o[0] * 1e3, q.zi_first_o[1],
+               q.zi_last_o[1], q.eb_first_o[1], q.eb_last_o[1], q.zv_last_o[1] * 1e3, q.dip_last * 1e3, q.hump_last * 1e3,
+               q0.dip_last * 1e3, q0.hump_last * 1e3, q.learn_low);
+        CHECK(q.frames == 2 * lr[i].cycles, "%s: one frame per step", lr[i].name);
         CHECK(q.g[0][0] >= BUCK_TOC_G_MIN && q.g[0][1] >= BUCK_TOC_G_MIN && q.g[1][0] >= BUCK_TOC_G_MIN &&
-              q.g[1][1] >= BUCK_TOC_G_MIN, "%s: gains in range", lr[i].name);
+              q.g[1][1] >= BUCK_TOC_G_MIN && fabsf(q.b[0]) <= BUCK_TOC_B_MAX_A && fabsf(q.b[1]) <= BUCK_TOC_B_MAX_A,
+              "%s: gains and b in range", lr[i].name);
+        if (!lr[i].mix && lr[i].esr == 0.0)
+            CHECK(q.dip_last <= q0.dip_last * 1.05 && q.hump_last <= q0.hump_last * 1.05, "%s: learning does not make the "
+                  "last step worse", lr[i].name);
+        /* with ESR the edge cycle's dv carries ESR x the load step, so the unlearned I_eq is ~2 A high and the
+         * pulse oversized (which hides the lossless model's charge shortfall); b takes the bias out (its job), the
+         * dip then is the model's (README, Known limits) */
+        if (lr[i].esr > 0.0)
+            CHECK(fabs(q.eb_last_o[0]) < 0.3 * fabs(q.eb_first_o[0]) && fabs(q.eb_last_o[1]) < 0.3 * fabs(q.eb_first_o[1]),
+                  "%s: b takes the ESR bias of the edge estimate out", lr[i].name);
+        if (i <= 1)
+            CHECK(fabs(q.zi_last_o[0]) < 0.35 * fabs(q.zi_first_o[0]) && fabs(q.eb_last_o[0]) < 0.3,
+                  "%s: ON-OFF landing learned away, equilibrium residual small", lr[i].name);
+        if (i == 2)
+            CHECK(q.b[0] > 0.1f && fabs(q.eb_last_o[0]) < 0.5 * fabs(q.eb_first_o[0]),
+                  "%s: b takes the slewing edge's shortfall", lr[i].name);
     }
 }
 

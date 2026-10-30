@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Post-link checks of the 600 kHz control loop (make check).
 
-Stage 2 (buck_obs_apt, 29 Oct 2026) adds rule 5 for the TOC code; see its text below.
+Stage 2 (buck_obs_apt, 29 Oct 2026) added rule 5 for the TOC code; stage 4 (30 Oct 2026, the
+feed-forward TOC) replaced it: see its text below.
 Stage 3 (30 Oct 2026, the Padé estimator and its table removed): rule 4 requires the unused
 g_buck.tune.alpha_i to be read nowhere; the other rules are unchanged (the CMP1 deadline guard,
 no fused/chained multiply-add in CCM, the CCM placement of the loop and of the TOC code).
@@ -976,34 +977,31 @@ def main():
                 errs, nt = tune_verdict(offs, r_ent, r_pass, r_every)
                 errors += ['tunables reload: ' + e for e in errs]
 
-    # 5. stage 2 (TOC and learning):
-    #  a. the TOC/learning code the loop calls lies in CCM: buck_toc_event, toc_episode and every
-    #     function whose name starts with toc_, buck_toc_ or buck_learn_ (the planner and learning
-    #     clocks and BUCK_TOC_STAGE_WCET assume zero wait states; stage-1 verifier F08);
+    # 5. stage 4 (the feed-forward TOC, 30 Oct 2026; Inc/buck_toc_start.h, Src/buck_toc.c):
+    #  a. the TOC code lies in CCM: every function whose name starts with toc_ or buck_toc_;
     #  b. no fused multiply-add there either (rule 2 covers all of .ccmtext);
-    #  c. every conditional store in that code is the TOC_GUARD form (Src/buck_toc.c):
+    #  c. every conditional store in the TOC functions is the TOC_GUARD form
     #         ldr  rC, [rH, #144]   Timer A CNTR       sub  rL, rC, rE   cmp  rL, rW
-    #         it   cc             strcc rV, [rA]      bcs  <fail>
-    #     and <fail> reaches toc_fail (the fault-5 trip) within 12 instructions, or (stage 2b: a missed
-    #     arming is a LATE reject, user decision 3) toc_arm_late; at least 6 of them (arming CMP1 and
-    #     release, return CMP1 and release, the D pass's CMP1 in both orders), at least 4 reaching
-    #     toc_fail (the return and D writes: a missed one there still trips);
-    #     the only other store to Timer A CMP1R there is toc_exit's BUCK_CMP_MIN after the gates
-    #     are off (as run_exit in Buck_disturb_obs);
-    #  e. (stage 2b) the TOC code calls nothing outside CCM: no bl to a flash function or a linker
-    #     veneer (a struct initializer that GCC turns into memset/memcpy would run from flash);
-    #  d. run_loop calls the TOC code only through BUCK_TOC_CALL (bl buck_toc_event), and never
-    #     between a pass's EOC poll read and its guarded CMP1 write: in address order, no such bl
-    #     lies between an ADC12_CSR load and the next guarded strcc of rule 3 (a linear
-    #     approximation of the path, the passes being laid out straight).
-    TOC_PREFIX = ('toc_', 'buck_toc_', 'buck_learn_')
+    #         it   cc/lo          strcc rV, [rA]      bcs  <miss>
+    #     (at least 3: the held duty's CMP1 after the frame, the restart CMP1, the return words), and the
+    #     two of them in buck_toc_finish (the CMP1 writes) reach toc_fail (fault 5) within 16
+    #     instructions (a bl, or the b.w of a tail call); the only other CMP1 store there is toc_exit's BUCK_CMP_MIN after the gates are off;
+    #  d. the inline start in run_loop (the HOLD copy, one per order): the guarded software updates of the
+    #     same form, whose stored value is MSWU | TASWU (#3) through a register holding HRTIM1 + 0x384
+    #     (CR2), at least 4 (two per order); in each order the high side is forced (a store to Timer A
+    #     SET1R #188 or RST1R #192) BEFORE the solve's square root (the feed-forward: the span runs while
+    #     it is solved), and the square root before that order's first update; run_loop calls
+    #     buck_toc_finish (after PASS_TOC) and buck_toc_ret (one per order), each through BUCK_TOC_CALL;
+    #  e. the TOC code calls nothing outside CCM: no bl to a flash function or a linker veneer (a struct
+    #     initializer that GCC turns into memset/memcpy would run from flash; buck_fatal excepted).
+    TOC_PREFIX = ('toc_', 'buck_toc_')
     tocfn = sorted((a, n, sz) for n, (a, sz) in syms.items()
                    if n.startswith(TOC_PREFIX) and sz > 0 and not n.startswith('__') and a < 0x20000000)   # code
     if not tocfn:
-        errors.append('stage 2: no TOC functions found')
+        errors.append('stage 4: no TOC functions found')
     for a, n, sz in tocfn:
         if not (CCM_LO <= a and a + sz <= CCM_HI):
-            errors.append(f'stage 2: {n} at 0x{a:08x} is not in CCM SRAM')
+            errors.append(f'stage 4: {n} at 0x{a:08x} is not in CCM SRAM')
     alldis = subprocess.run([objdump, '-d', '--no-show-raw-insn', elf], capture_output=True, text=True,
                             check=True).stdout
     allins = []
@@ -1011,52 +1009,100 @@ def main():
         m = re.match(r'\s*([0-9a-f]+):\s+(\S+)\s*(.*)', line)
         if m:
             allins.append((int(m.group(1), 16), m.group(2), m.group(3).split('@')[0].strip()))
-    fail_fn = [(a, sz) for a, n, sz in tocfn if n.startswith('toc_fail')]
-    late_fn = [(a, sz) for a, n, sz in tocfn if n.startswith('toc_arm_late')]
-    toc_guarded_fail = 0
-    exit_fn = [(a, sz) for a, n, sz in tocfn if n.startswith('toc_exit')]
-    toc_guarded = 0
     idx = {a: k for k, (a, _, _) in enumerate(allins)}
+    fail_fn = [(a, sz) for a, n, sz in tocfn if n.startswith('toc_fail')]
+
+    def guard_form(k):
+        """The TOC_GUARD form around the conditional store allins[k]; returns the miss target or None."""
+        if k < 4 or k + 1 >= len(allins):
+            return None
+        pat = [allins[k - j] for j in (4, 3, 2, 1)] + [allins[k + 1]]
+        ok = (pat[0][1].startswith('ldr') and pat[0][2].endswith('#144]') and pat[1][1].startswith('sub') and
+              pat[2][1].startswith('cmp') and pat[3][1] == 'it' and pat[3][2] in ('cc', 'lo') and
+              pat[4][1].startswith(('bcs', 'bhs')))
+        if not ok:
+            return None
+        t = re.search(r'([0-9a-f]+) <', pat[4][2])
+        return int(t.group(1), 16) if t else None
+
+    def reaches(tgt, fns, steps=16):
+        k2, n_ = idx.get(tgt), 0
+        while k2 is not None and n_ < steps:
+            x = allins[k2]
+            n_ += 1
+            if x[1] in ('bl', 'b', 'b.n', 'b.w') and any(fa <= int(x[2].split()[0], 16) < fa + fs for fa, fs in fns):
+                return True                     # a call, or a tail call (b.w after the epilogue)
+            if x[1] in ('b', 'b.n', 'b.w'):
+                k2 = idx.get(int(x[2].split()[0], 16))
+            else:
+                k2 += 1
+        return False
+
+    toc_guarded = toc_guarded_fail = 0
     for a0, n, sz in tocfn:
-        if not n.startswith(('toc_', 'buck_toc_event')):
-            continue                            # the planner and learning code (no HRTIM access)
-        body5 = [(k, x) for k, x in enumerate(allins) if a0 <= x[0] < a0 + sz]
-        for k, (a, op, args) in body5:
-            if op.startswith('str') and op[3:5] in ('cc', 'lo') or op.startswith(('strcc', 'strlo')):
-                pat = [allins[k - j] for j in (4, 3, 2, 1)] + [allins[k + 1]] if k >= 4 else []
-                ok = (len(pat) == 5 and pat[0][1].startswith('ldr') and pat[0][2].endswith('#144]') and
-                      pat[1][1].startswith('sub') and pat[2][1].startswith('cmp') and pat[3][1] == 'it' and
-                      pat[3][2] in ('cc', 'lo') and pat[4][1].startswith(('bcs', 'bhs')))
-                if ok:
-                    t = re.search(r'([0-9a-f]+) <', pat[4][2])
-                    tgt = int(t.group(1), 16) if t else None
-                    reach = None
-                    k2, steps = idx.get(tgt), 0
-                    while k2 is not None and steps < 16 and reach is None:
-                        x = allins[k2]
-                        steps += 1
-                        if x[1] == 'bl' and any(fa <= int(x[2].split()[0], 16) < fa + fs for fa, fs in fail_fn):
-                            reach = 'fail'
-                        elif x[1] == 'bl' and any(fa <= int(x[2].split()[0], 16) < fa + fs for fa, fs in late_fn):
-                            reach = 'late'
-                        elif x[1] in ('b', 'b.n', 'b.w'):
-                            k2 = idx.get(int(x[2].split()[0], 16))
-                        else:
-                            k2 += 1
-                    if reach is not None:
-                        toc_guarded += 1
-                        toc_guarded_fail += (reach == 'fail')
+        for k, (a, op, args) in enumerate(allins):
+            if not (a0 <= a < a0 + sz):
+                continue
+            if op.startswith(('strcc', 'strlo')):
+                tgt = guard_form(k)
+                if tgt is None:
+                    errors.append(f'stage 4: conditional store at 0x{a:08x} ({n}) is not the TOC_GUARD form')
+                    continue
+                toc_guarded += 1
+                if n.startswith('buck_toc_finish'):
+                    if reaches(tgt, fail_fn):
+                        toc_guarded_fail += 1
                     else:
-                        errors.append(f'stage 2: guarded store at 0x{a:08x} ({n}) reaches neither toc_fail nor toc_arm_late')
-                else:
-                    errors.append(f'stage 2: conditional store at 0x{a:08x} ({n}) is not the TOC_GUARD form')
-    if toc_guarded < 6:
-        errors.append(f'stage 2: {toc_guarded} TOC guarded writes found (6 expected at least)')
-    if toc_guarded_fail < 4:
-        errors.append(f'stage 2b: {toc_guarded_fail} TOC guarded writes reach toc_fail (4 expected at least)')
-    # e. (stage 2b) no call from the TOC code out of CCM (buck_fatal, the no-return fault path, excepted)
+                        errors.append(f'stage 4: guarded store at 0x{a:08x} ({n}) does not reach toc_fail')
+    if toc_guarded < 3:
+        errors.append(f'stage 4: {toc_guarded} TOC guarded writes found in the TOC functions (3 expected at least)')
+    if toc_guarded_fail < 2:
+        errors.append(f'stage 4: {toc_guarded_fail} guarded CMP1 writes of buck_toc_finish reach toc_fail (2 expected)')
+    # d. the inline start in run_loop
+    swu = []
+    for k, (a, op, args) in enumerate(body):
+        if op.startswith(('strcc', 'strlo')) and '#156]' not in args and '[sp' not in args:
+            kk = idx.get(a)
+            if kk is not None and guard_form(kk) is not None:
+                swu.append(k)
+    n_swu_ok = 0
+    for k in swu:
+        # the stored register holds #3 (MSWU | TASWU): a mov of #3 into it within 12 instructions before
+        reg = body[k][2].split(',')[0].strip()
+        if any(body[j][1].startswith('mov') and body[j][2].replace(' ', '') == f'{reg},#3' for j in range(max(0, k - 12), k)):
+            n_swu_ok += 1
+        else:
+            errors.append(f'stage 4: guarded store at 0x{body[k][0]:08x} in run_loop is not a software update (#3)')
+    if n_swu_ok < 4:
+        errors.append(f'stage 4: {n_swu_ok} guarded software updates in run_loop (4 expected at least: 2 per order)')
+    sqrts = [k for k, (a, op, args) in enumerate(body) if op.startswith('vsqrt')]
+    forced = [k for k, (a, op, args) in enumerate(body)
+              if op.startswith('str') and not op.startswith('strd') and re.search(r'#(188|192)\]$', args)]
+    if len(sqrts) != 2:
+        errors.append(f'stage 4: {len(sqrts)} square roots in run_loop (2 expected: one solve per order)')
+    for q in sqrts:
+        before = [k for k in forced if q - 40 <= k < q]
+        after_swu = [k for k in swu if q < k <= q + 60]
+        if not before:
+            errors.append(f'stage 4: the square root at 0x{body[q][0]:08x} has no forced output store (SET1R/RST1R) '
+                          f'in the 40 instructions before it: the span would wait for the solve')
+        if not after_swu:
+            errors.append(f'stage 4: no software update within 60 instructions after the square root at 0x{body[q][0]:08x}')
+    fin = {syms[n][0] & ~1 for n in syms if n == 'buck_toc_finish'}
+    ret = {syms[n][0] & ~1 for n in syms if n == 'buck_toc_ret'}
+    calls = [(k, int(args.split()[0], 16)) for k, (a, op, args) in enumerate(body) if op == 'bl']
+    n_fin = sum(1 for k, t in calls if t in fin)
+    n_ret = sum(1 for k, t in calls if t in ret)
+    for k, t in calls:
+        if t in fin or t in ret:
+            if not (k >= 2 and body[k - 2][1].startswith('stmdb') and body[k - 1][1] == 'vpush'):
+                errors.append(f'stage 4: bl at 0x{body[k][0]:08x} into the TOC code is not a BUCK_TOC_CALL')
+    if n_fin < 1:
+        errors.append('stage 4: run_loop does not call buck_toc_finish')
+    if n_ret < 2:
+        errors.append(f'stage 4: run_loop calls buck_toc_ret {n_ret} times (2 expected: one per order)')
+    # e. no call from the TOC code out of CCM (buck_fatal, the no-return fault path, excepted)
     fatal_addrs = {syms[n][0] & ~1 for n in syms if n in ('buck_fatal', '__buck_fatal_veneer')}
-    toc_calls_out = 0
     for a0, n, sz in tocfn:
         for a, op, args in allins:
             if a0 <= a < a0 + sz and op in ('bl', 'blx') and args:
@@ -1065,31 +1111,7 @@ def main():
                     continue
                 tgt = int(t.group(1), 16)
                 if not (CCM_LO <= tgt < CCM_HI) and tgt not in fatal_addrs:
-                    errors.append(f'stage 2b: {n} at 0x{a:08x} calls 0x{tgt:08x} outside CCM ({args})')
-                    toc_calls_out += 1
-    # literal 0x4001689c (Timer A CMP1R) or HRTIM base + #156 stores outside the guards and toc_exit
-    cmp1_lit = {a for a, op, args in allins if op == '.word' and args.split()[0] == '4001689c'}
-    for a0, n, sz in tocfn:
-        if n.startswith('toc_exit'):
-            continue
-        for a, op, args in allins:
-            if a0 <= a < a0 + sz and op.startswith('ldr') and '[pc' in args:
-                p2 = re.search(r'; \(?([0-9a-f]+)', args)
-    # d. no bl into the TOC code between an ADC12_CSR read and the next guarded CMP1 write in run_loop
-    toc_entry = {syms[n][0] & ~1 for n in syms if n == 'buck_toc_event'}
-    csr_reads = [i for i, (a, op, args) in enumerate(body) if op.startswith('ldr') and re.search(r'#768\]', args)]
-    strccs = [i for i, (a, op, args) in enumerate(body) if op.startswith(('strcc', 'strlo')) and '#156]' in args]
-    for i in csr_reads:
-        j = next((k for k in strccs if k > i), None)
-        if j is None:
-            continue
-        for k in range(i, j):
-            a, op, args = body[k]
-            if op == 'bl' and int(args.split()[0], 16) in toc_entry:
-                errors.append(f'stage 2: bl buck_toc_event at 0x{a:08x} between a sample read and its CMP1 write')
-    n_calls = sum(1 for a, op, args in body if op == 'bl' and int(args.split()[0], 16) in toc_entry)
-    if n_calls == 0:
-        errors.append('stage 2: run_loop does not call buck_toc_event')
+                    errors.append(f'stage 4: {n} at 0x{a:08x} calls 0x{tgt:08x} outside CCM ({args})')
 
     for e in errors:
         print('check_loop: FAIL:', e)
@@ -1098,9 +1120,9 @@ def main():
               f'{" and the arming write" if arm is not None else ""}, '
               f'no fused multiply-add, all {nt} tunables read at the loop entry (up to the first ADC12_CSR read: the '
               f'arming wait\'s) and in the passes, obs_beta and obs_gamma not on the path of an ordinary pass ({nloops} loops & 31 tests); '
-              f'stage 2: {len(tocfn)} TOC functions in CCM, {toc_guarded} TOC guarded writes ({toc_guarded_fail} to toc_fail, '
-              f'{toc_guarded - toc_guarded_fail} to toc_arm_late), no call out of CCM, {n_calls} TOC calls in run_loop, '
-              f'none between a sample read and its CMP1 write)')
+              f'stage 4: {len(tocfn)} TOC functions in CCM, {toc_guarded} TOC guarded writes ({toc_guarded_fail} CMP1 to '
+              f'toc_fail), {n_swu_ok} guarded software updates in the inline start, the high side forced before each '
+              f'of its {len(sqrts)} solves, no call out of CCM)')
     return 1 if errors else 0
 
 

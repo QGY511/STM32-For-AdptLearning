@@ -1,11 +1,11 @@
 /* Host tests for Inc/buck_ctrl.h (the exact code the firmware runs).
  *
- * 1. Padé coefficients, prediction and correction against a double-precision
- *    transcription of the specification; the trigger score a e_v^2 + b e_v + c
- *    (user, 25 Oct) against the formula in double.
- * 2. Observer error dynamics: with the nominal model and noiseless, time-
- *    aligned measurements the valley error obeys e[k+1] = A_I (1 - alpha) e[k].
- *    The load-current observer (user, 25 Oct): its step against the recursion
+ * Stage 4 (30 Oct 2026): the Padé estimator is gone (stage 3); its sections
+ * (the coefficient table, prediction and correction against the specification,
+ * the valley-error dynamics, the closed loop's direct form) went with it.
+ * 1. The trigger score a e_v^2 + b e_v + c (user, 25 Oct) against the formula
+ *    in double; the reference ramp.
+ * 2. The load-current observer (user, 25 Oct): its step against the recursion
  *    in double and the two first-order stages it equals; the reload check of
  *    its gains against an exact reference of the stable region; its seed.
  * 3. Closed loop: a switched synchronous buck (L, r_L, C, dead time with
@@ -22,139 +22,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "buck_ctrl.h"
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { ++failures; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
-static double rel(double a, double b) { return fabs(a - b) / fmax(fabs(b), 1e-9); }
 static int same_bits(float a, float b) { uint32_t x, y; memcpy(&x, &a, 4); memcpy(&y, &b, 4); return x == y; }
-
-/* The firmware predicts from a 24-byte table row (buck_est_predict_row); the
- * direct form is buck_est_predict() with a buck_pade_t and the duty. Both
- * must give the same iv_pred, avg_pred, kappa and i_peak, bit for bit. */
-static int row_differs(const buck_pade_t *k, const buck_pade_row_t *row, uint32_t cmp, float iv, float v, float alpha)
-{
-    buck_state_t a = { .iv = iv }, b = a;
-    const float ip = buck_est_predict(&a, k, buck_cmp_to_duty(cmp), v, alpha);
-    const float ip_h = buck_est_predict_row(&b, row, v, alpha);
-    return !same_bits(ip, ip_h + ip_h) || !same_bits(a.iv_pred, b.iv_pred) ||
-           !same_bits(a.avg_pred, b.avg_pred) || !same_bits(a.kappa, b.kappa);
-}
-
-/* ---- 1. against the specification, in double ------------------------------ */
-typedef struct { double aon, bon, aoff, boff, A, H; } ref_coef_t;
-
-static ref_coef_t ref_coeffs(double ton)
-{
-    const double T = BUCK_TSW_S, L = BUCK_L_H, th = BUCK_RL_OHM / BUCK_L_H, toff = T - ton;
-    ref_coef_t c;
-    c.aon  = (2 - th * ton) / (2 + th * ton);          /* a(tau) */
-    c.bon  = 2 * ton / (L * (2 + th * ton));           /* b(tau) */
-    c.aoff = (2 - th * toff) / (2 + th * toff);
-    c.boff = 2 * toff / (L * (2 + th * toff));
-    const double D = ton / T;
-    c.A = c.aoff * c.aon;                              /* A_I */
-    c.H = 0.5 * (c.aon + D + (1 - D) * c.A);           /* H_I */
-    return c;
-}
-
-static void test_against_spec(void)
-{
-    buck_pade_t *tab = malloc(sizeof(buck_pade_t) * BUCK_PADE_N);
-    buck_pade_table(tab);
-    buck_pade_row_t *rows = malloc(sizeof(buck_pade_row_t) * BUCK_PADE_N);
-    buck_pade_rows(rows);
-    long row_bad = 0;
-    double worst = 0.0;
-    for (uint32_t i = 0; i < BUCK_PADE_N; ++i) {
-        const uint32_t cmp = BUCK_CMP_MIN + i;
-        const double ton = (double)(cmp - BUCK_DT_TICKS) * BUCK_TICK_S;
-        const ref_coef_t r = ref_coeffs(ton);
-        worst = fmax(worst, rel(tab[i].aon, r.aon));
-        worst = fmax(worst, rel(tab[i].bon, r.bon));
-        worst = fmax(worst, rel(tab[i].aoff, r.aoff));
-        worst = fmax(worst, rel(tab[i].boff, r.boff));
-        worst = fmax(worst, rel(tab[i].a_over_h, r.A / r.H));
-        CHECK(r.A > 0 && r.A <= 1 && r.H > 0, "A_I/H_I range at cmp %u", cmp);
-    }
-    printf("coefficient table (%u entries) vs spec: worst relative error %.2e\n", (unsigned)BUCK_PADE_N, worst);
-    CHECK(worst < 2e-6, "coefficient table");
-
-    /* One full cycle: predict, correct, load estimate, trigger. */
-    srand(1);
-    double w_pred = 0, w_corr = 0;
-    for (int n = 0; n < 200000; ++n) {
-        const uint32_t cmp = BUCK_CMP_MIN + (uint32_t)rand() % BUCK_PADE_N;
-        const double ton = (double)(cmp - BUCK_DT_TICKS) * BUCK_TICK_S, D = ton / BUCK_TSW_S;
-        const double iv = -2.0 + 12.0 * rand() / RAND_MAX, v = 0.2 + 1.2 * rand() / RAND_MAX;
-        const double im = -2.0 + 12.0 * rand() / RAND_MAX, alpha = 0.001 + 0.999 * rand() / RAND_MAX;
-        const ref_coef_t r = ref_coeffs(ton);
-        const double ip = r.aon * iv + r.bon * (BUCK_VIN_V - v);            /* valley_to_peak_update */
-        const double ivp = r.aoff * ip - r.boff * v;                        /* uncorrected_valley_prediction */
-        const double avg = 0.5 * (ip + D * iv + (1 - D) * ivp);             /* uncorrected_average_prediction */
-        const double kap = alpha * r.A / r.H;                               /* current_observer_gain */
-        const double eps = im - avg;                                        /* current_prediction_residual */
-        const double iv1 = ivp + kap * eps;                                 /* corrected_valley_current */
-        const double avgc = avg + alpha * eps;                              /* corrected_average_current */
-
-        buck_state_t s = { .iv = (float)iv };
-        const float fip = buck_est_predict(&s, &tab[cmp - BUCK_CMP_MIN], buck_cmp_to_duty(cmp), (float)v, (float)alpha);
-        row_bad += row_differs(&tab[cmp - BUCK_CMP_MIN], &rows[cmp - BUCK_CMP_MIN], cmp, (float)iv, (float)v, (float)alpha);
-        float feps;
-        const float favg = buck_est_correct(&s, (float)im, (float)alpha, &feps);
-        const double scale = 10.0;   /* compare in absolute terms against a 10 A scale */
-        w_pred = fmax(w_pred, fabs(fip - ip) / scale);
-        w_pred = fmax(w_pred, fabs(s.iv_pred - ivp) / scale);
-        w_pred = fmax(w_pred, fabs(s.avg_pred - avg) / scale);
-        w_pred = fmax(w_pred, rel(s.kappa, kap));
-        w_corr = fmax(w_corr, fabs(feps - eps) / scale);
-        w_corr = fmax(w_corr, fabs(s.iv - iv1) / scale);
-        w_corr = fmax(w_corr, fabs(favg - avgc) / scale);
-    }
-    printf("prediction vs spec: worst error %.2e; correction: %.2e (relative to 10 A)\n", w_pred, w_corr);
-    CHECK(w_pred < 1e-5 && w_corr < 1e-5, "prediction/correction");
-    /* Every row, at valley currents and voltages over and beyond the range (signed zeros included). */
-    static const float ivs[] = { 0.0f, -0.0f, 1e-3f, -2.0f, 0.37f, 3.3f, 9.99f, 12.0f, 300.0f, -300.0f };
-    static const float vs[] = { 0.0f, -0.0f, 0.8057f, 1.9f, 3.3f, 6.0f, 7.5f, -0.4f };
-    static const float alphas[] = { (float)BUCK_ALPHA_I, 1.0f, 0.3f };
-    for (uint32_t i = 0; i < BUCK_PADE_N; ++i)
-        for (unsigned a = 0; a < sizeof ivs / sizeof ivs[0]; ++a)
-            for (unsigned b = 0; b < sizeof vs / sizeof vs[0]; ++b)
-                row_bad += row_differs(&tab[i], &rows[i], BUCK_CMP_MIN + i, ivs[a], vs[b], alphas[(i + a + b) % 3]);
-    CHECK(row_bad == 0, "table rows: %ld predictions not bit-identical to the direct form", row_bad);
-    free(rows);
-    free(tab);
-}
-
-/* ---- 2. observer error dynamics --------------------------------------------- */
-static void test_observer_dynamics(void)
-{
-    /* "True" plant: the nominal Padé model, noiseless measurement = its own
-     * trapezoidal cycle average (time aligned). */
-    const uint32_t cmp = 1800U;
-    const double ton = (double)(cmp - BUCK_DT_TICKS) * BUCK_TICK_S, D = ton / BUCK_TSW_S;
-    const ref_coef_t r = ref_coeffs(ton);
-    buck_pade_t k;
-    buck_pade_coeffs(&k, (float)ton);
-    const float alpha = 0.0328f, v = 0.8f;
-    double iv_true = 2.0;
-    buck_state_t s = { .iv = 0.0f };
-    double worst = 0.0;
-    for (int n = 0; n < 40; ++n) {
-        const double ip = r.aon * iv_true + r.bon * (BUCK_VIN_V - v);
-        const double iv_next = r.aoff * ip - r.boff * v;
-        const double avg = 0.5 * (ip + D * iv_true + (1 - D) * iv_next);
-        const double e0 = iv_true - s.iv;
-        buck_est_predict(&s, &k, buck_cmp_to_duty(cmp), v, alpha);
-        float eps;
-        buck_est_correct(&s, (float)avg, alpha, &eps);
-        iv_true = iv_next;
-        const double e1 = iv_true - s.iv;
-        if (fabs(e0) > 1e-2) worst = fmax(worst, fabs(e1 / e0 - r.A * (1 - alpha)));
-    }
-    printf("observer error ratio vs A_I(1 - alpha_I) = %.5f: worst deviation %.1e\n", r.A * (1 - alpha), worst);
-    CHECK(worst < 1e-4, "observer error dynamics");
-}
 
 /* ---- 2b. reference ramp --------------------------------------------------------
  * The references are the two forms the firmware ran before, with their
@@ -332,14 +207,14 @@ static float logu(double lo, double hi) { return (float)exp(log(lo) + (log(hi) -
 static float slogu(double lo, double hi) { const float x = logu(lo, hi); return (rand() & 1) ? -x : x; }
 
 /* one buck_ctrl_slow() with v, V_ref and the tunables: returns g, the published S in *S */
-static uint32_t slow_once(const buck_tune_t *t, const buck_pade_row_t *rows, float v, float vref, float *S, buck_state_t *so)
+static uint32_t slow_once(const buck_tune_t *t, float v, float vref, float *S, buck_state_t *so)
 {
     buck_state_t s;
     memset(&s, 0, sizeof s);
-    s.vref = vref; s.iv = 1.0f; s.cmp_active = BUCK_CMP_MIN + 700U;
-    const buck_step_t st = { .v = v, .im = 1.0f, .iavg = 1.0f, .eps = 0.0f, .iref = 1.0f, .cmp = BUCK_CMP_MIN + 900U };
+    s.vref = vref; s.cmp_active = BUCK_CMP_MIN + 700U;
+    const buck_step_t st = { .v = v, .im = 1.0f, .iref = 1.0f, .cmp = BUCK_CMP_MIN + 900U };
     buck_out_t o;
-    const uint32_t g = buck_ctrl_slow(t, &s, &st, rows, &o);
+    const uint32_t g = buck_ctrl_slow(t, &s, &st, &o);
     *S = o.score;
     if (so) *so = s;
     return g;
@@ -347,8 +222,6 @@ static uint32_t slow_once(const buck_tune_t *t, const buck_pade_row_t *rows, flo
 
 static void test_score(void)
 {
-    buck_pade_row_t *rows = malloc(sizeof(buck_pade_row_t) * BUCK_PADE_N);
-    buck_pade_rows(rows);
     /* the formula, in double */
     double worst = 0.0;
     long neg = 0;
@@ -402,7 +275,7 @@ static void test_score(void)
         buck_tune_t t = BUCK_TUNE_DEFAULTS;
         t.score_a = sp[i].a; t.score_b = sp[i].b; t.score_c = sp[i].c; t.s_th = sp[i].sth;
         float S;
-        const uint32_t g = slow_once(&t, rows, 1.0f + sp[i].ev, 1.0f, &S, NULL);
+        const uint32_t g = slow_once(&t, 1.0f + sp[i].ev, 1.0f, &S, NULL);
         const int cls = isnan(S) ? 0 : (S == INFINITY) ? 1 : (S == -INFINITY) ? 2 : (S < 0.0f) ? 3 : 4;
         if (cls != sp[i].cls || g != sp[i].g) {
             ++sp_bad;
@@ -424,14 +297,14 @@ static void test_score(void)
         const float v = (float)(3.3 * urand()), vref = (float)(3.3 * urand());
         float S, S2;
         buck_state_t s1, s2;
-        const uint32_t g = slow_once(&t, rows, v, vref, &S, &s1);
+        const uint32_t g = slow_once(&t, v, vref, &S, &s1);
         g_bad += g != ((S >= t.s_th) ? 1U : 0U);
         g_on += g; ++g_n;
         const double e = (double)v - (double)vref, a = t.score_a, b = t.score_b, c = t.score_c;
         worst_g = fmax(worst_g, fabs((double)S - (a * e * e + b * e + c)) / (fabs(a) * e * e + fabs(b * e) + fabs(c)));
         buck_tune_t t2 = t;
         t2.obs_beta = slogu(1e-3, 3.0); t2.obs_gamma = slogu(1e-3, 1e3);   /* other observer gains, inside or not */
-        const uint32_t g2 = slow_once(&t2, rows, v, vref, &S2, &s2);
+        const uint32_t g2 = slow_once(&t2, v, vref, &S2, &s2);
         sep_bad += g2 != g || !same_bits(S2, S) || memcmp(&s1, &s2, sizeof s1) != 0;
     }
     printf("trigger score a e_v^2 + b e_v + c: within %.1e of the double reference relative to |a| e_v^2 + |b e_v| + |c| "
@@ -443,7 +316,6 @@ static void test_score(void)
     /* (S within 5 roundings here: e_v = v - V_ref is rounded too) */
     CHECK(g_bad == 0 && g_on > 1000 && g_on < g_n - 1000 && worst_g < 4e-7 && sep_bad == 0,
           "D4 follows S_th; the observer's gains do not reach the score, D4 or the controller");
-    free(rows);
 }
 
 /* ---- 2e. load current: the observer (user, 25 Oct) ------------------------------
@@ -721,23 +593,6 @@ static void test_obs_gains(void)
 }
 
 /* ---- 3. closed loop ---------------------------------------------------------- */
-/* buck_ctrl_slow() in its direct form (buck_pade_t and the CMP1 duty, as
- * before the 24-byte rows): the closed loop runs it side by side with the
- * firmware's form and requires every output and state bit to match. */
-static uint32_t ref_ctrl_slow(const buck_tune_t *t, buck_state_t *s, const buck_step_t *st,
-                              const buck_pade_t *pade, buck_out_t *o)
-{
-    const float v = st->v, iref = st->iref;
-    const float S = buck_trigger_score_k(v - s->vref, buck_score_k(t));   /* checked in test_score */
-    const uint32_t g = (S >= t->s_th) ? 1U : 0U;
-    const uint32_t ca = s->cmp_active;
-    const float ip = buck_est_predict(s, &pade[ca - BUCK_CMP_MIN], buck_cmp_to_duty(ca), v, t->alpha_i);
-    s->cmp_active = st->cmp;
-    o->v = v; o->i_meas = st->im; o->i_avg = st->iavg; o->eps = st->eps;   /* o->i_load: the observer's, as buck_ctrl_slow_k() */
-    o->i_ref = iref; o->i_peak = ip; o->vref = s->vref; o->score = S; o->g = g; o->cmp = st->cmp;
-    return g;
-}
-
 typedef struct {
     double L, rl, C, esr, vin, vd;      /* plant */
     double i, vc, y;                    /* inductor current, capacitor voltage, sensor filter state */
@@ -805,7 +660,6 @@ typedef struct {
     int noise;
     const char *name;
     int ideal_dt;
-    float alpha;                   /* 0: the configured alpha_I */
     float s_th;                    /* 0: the configured S_th */
     int score_set;                 /* 1: the score coefficients below; 0: the configured a, b, c */
     float score_a, score_b, score_c;
@@ -838,20 +692,15 @@ static double st_rms_dev(const stat_t *s) { const double m = st_mean(s); return 
 
 static void run_closed_loop(const scen_t *sc, int strict)
 {
-    static buck_pade_t tab[BUCK_PADE_N];
-    static buck_pade_row_t rows[BUCK_PADE_N];
-    buck_pade_table(tab);
-    buck_pade_rows(rows);
     const double T = BUCK_TSW_S, tick = BUCK_TICK_S, lat = 45e-9;   /* ADC trigger-to-hold latency */
     plant_t p = { .L = sc->L_plant, .rl = BUCK_RL_OHM, .C = BUCK_C_F, .esr = sc->esr, .vin = sc->vin_plant,
                   .vd = 0.7, .R = sc->i_base_R, .noise = sc->noise, .ideal_dt = sc->ideal_dt };
     buck_tune_t tune = BUCK_TUNE_DEFAULTS;
-    if (sc->alpha > 0.0f) tune.alpha_i = sc->alpha;
     if (sc->s_th > 0.0f) tune.s_th = sc->s_th;
     if (sc->score_set) { tune.score_a = sc->score_a; tune.score_b = sc->score_b; tune.score_c = sc->score_c; }
     if (sc->obs_beta != 0.0f) tune.obs_beta = sc->obs_beta;
     if (sc->obs_gamma != 0.0f) tune.obs_gamma = sc->obs_gamma;
-    /* the direct form runs with other observer gains (D4, the score and the
+    /* the same controller beside it with other observer gains (D4, the score and the
      * whole controller must not notice) */
     buck_tune_t tune_ref = tune;
     tune_ref.obs_beta = 0.5f; tune_ref.obs_gamma = 1.0f;
@@ -859,7 +708,7 @@ static void run_closed_loop(const scen_t *sc, int strict)
     buck_out_t o;
     memset(&s, 0, sizeof s);
     memset(&o, 0, sizeof o);
-    buck_state_t s_ref;                 /* the direct form (ref_ctrl_slow) and the per-cycle ramp run side by side */
+    buck_state_t s_ref;                 /* the controller with other observer gains and the per-cycle ramp, side by side */
     buck_out_t o_ref;
     memset(&o_ref, 0xA5, sizeof o_ref);     /* every field must be written: the cycle compare reads them all */
     ramp_ref_t ramp_ref = { 0.0f, ~0U };
@@ -973,7 +822,7 @@ static void run_closed_loop(const scen_t *sc, int strict)
         }
         buck_step_t stp;
         pend2 = buck_ctrl_fast(&tune, &s, adc_v, isum, &stp);
-        const uint32_t g = buck_ctrl_slow(&tune, &s, &stp, rows, &o);
+        const uint32_t g = buck_ctrl_slow(&tune, &s, &stp, &o);
         /* the load current and A2 from the firmware's observer (buck_iload_obs, as run_pass) */
         uint32_t a2_now = ~0U;
         const float y = buck_iload_obs(&x, stp.v, stp.im, ok, &a2_now);
@@ -1007,11 +856,11 @@ static void run_closed_loop(const scen_t *sc, int strict)
             rtarget = buck_ramp_target(&tune); rmode = buck_ramp_mode(s.vref, rtarget);
             ok = buck_obs_k(&tune, ok);
         }
-        {   /* the same samples through the direct form (buck_pade_t and the CMP1 duty) and the
-             * per-cycle ramp behind its vref_reached gate: every bit must match */
+        {   /* the same samples through the controller with other observer gains and the per-cycle
+             * ramp behind its vref_reached gate: every bit must match */
             buck_step_t stp_ref;
             const uint32_t cmp_ref = buck_ctrl_fast(&tune_ref, &s_ref, adc_v, isum, &stp_ref);
-            const uint32_t g_ref = ref_ctrl_slow(&tune_ref, &s_ref, &stp_ref, tab, &o_ref);
+            const uint32_t g_ref = buck_ctrl_slow(&tune_ref, &s_ref, &stp_ref, &o_ref);
             o_ref.i_load = o.i_load;                     /* the observer's (not the direct form's) */
             ramp_ref.vref = s_ref.vref;
             ramp_clamp(tune.vref_counts, &ramp_ref);      /* base2's form */
@@ -1048,10 +897,10 @@ static void run_closed_loop(const scen_t *sc, int strict)
         if (tn >= sc->t_step_up && tn < sc->t_step_down && fabs(vsample - vref) > 0.005) t_last_out_up = tn - sc->t_step_up;
     }
     CHECK(s.vref == buck_ramp_target(&tune) && rmode == BUCK_RAMP_HOLD, "%s: soft-start ramp finished", sc->name);
-    CHECK(ident_bad == 0, "%s: %ld cycles differ from the direct form (run with observer gains %g, %g)", sc->name, ident_bad,
+    CHECK(ident_bad == 0, "%s: %ld cycles differ with other observer gains (%g, %g)", sc->name, ident_bad,
           (double)tune_ref.obs_beta, (double)tune_ref.obs_gamma);
-    printf("\n[%s] L=%.0f nH, Vin=%.2f V, ESR=%.0f mOhm, ADC noise +-%d LSB, alpha_I %.4f\n", sc->name, sc->L_plant * 1e9,
-           sc->vin_plant, sc->esr * 1e3, sc->noise, (double)tune.alpha_i);
+    printf("\n[%s] L=%.0f nH, Vin=%.2f V, ESR=%.0f mOhm, ADC noise +-%d LSB\n", sc->name, sc->L_plant * 1e9,
+           sc->vin_plant, sc->esr * 1e3, sc->noise);
     printf("  v_out as measured (mean of the two samples)  %.1f A: mean %.4f V (V_ref %.4f), p-p %.1f mV | %.1f A: mean %.4f V, p-p %.1f mV\n",
            vref / sc->i_base_R, st_mean(&v_lo), vref, (v_lo.mx - v_lo.mn) * 1e3,
            vref / sc->i_base_R + sc->i_step, st_mean(&v_hi), (v_hi.mx - v_hi.mn) * 1e3);
@@ -1096,7 +945,7 @@ static void run_closed_loop(const scen_t *sc, int strict)
            rec_worst, is_def ? id_worst : NAN, is_def ? iddd_worst : NAN);
     printf("  steady state, low / high load: measured average error %.3f / %.3f A, corrected estimate error %.3f / %.3f A\n",
            st_mean(&e_meas_lo), st_mean(&e_meas_hi), st_mean(&e_avg_lo), st_mean(&e_avg_hi));
-    printf("  corrected average-current estimate error after soft-start (incl. steps): %.3f A mean / %.3f A rms\n", st_mean(&e_iavg), st_rms_dev(&e_iavg));
+    printf("  measured average-current error after soft-start (incl. steps): %.3f A mean / %.3f A rms\n", st_mean(&e_iavg), st_rms_dev(&e_iavg));
     printf("  duty compare at low load: %.1f ticks, rms jitter %.2f ticks\n", st_mean(&cmp_lo), st_rms_dev(&cmp_lo));
     printf("  trigger (S_th = %g): %ld cycles in steady state, %ld after the step up, %ld after the step down; "
            "peak S %.2g / %.2g / %.2g\n", (double)tune.s_th, trig_steady, trig_up, trig_down, s_steady_max, s_up_max, s_down_max);
@@ -1155,16 +1004,14 @@ static void run_closed_loop(const scen_t *sc, int strict)
 
 int main(void)
 {
-    test_against_spec();
     test_score();
-    test_observer_dynamics();
     test_ramp();
     test_obs();
     test_obs_gains();
-    /* Plant identical to the estimator's model (dead time = off-time with the
-     * switch node at 0 V): checks the implementation end to end. */
+    /* Plant with the switch node at 0 V in the dead time (the ideal-switch model):
+     * checks the implementation end to end. */
     scen_t ideal = { 15e-3, 20e-3, 25e-3, 0.8057, 2.0, BUCK_L_H, BUCK_VIN_V, 0.0, 0, "switch node 0 V in dead time (= model)", 1,
-                     0.0f, 0.0f, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1, -1 };
+                     0.0f, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1, -1 };
     run_closed_loop(&ideal, 2);
     /* the same with the trigger threshold low enough for the 2 A steps (D4 only:
      * the score does not reach A2) */
@@ -1184,12 +1031,10 @@ int main(void)
     ideal_abc.trig_up = 0; ideal_abc.trig_down = 1;
     run_closed_loop(&ideal_abc, 1);
     /* Realistic dead time: body-diode conduction (V_in + 0.7 V for negative,
-     * -0.7 V for positive current). The model's "dead time is off-time"
-     * then misses up to ~V_in DT/T_sw of volt-seconds: the estimate î̄_L is
-     * biased (reported, not a failure), regulation must still hold; A2 (the
-     * observer on the measured average) must not be. */
+     * -0.7 V for positive current): regulation must still hold; A2 (the observer on
+     * the measured average) must not be biased. */
     const scen_t nominal = { 15e-3, 20e-3, 25e-3, 0.8057, 2.0, BUCK_L_H, BUCK_VIN_V, 0.0, 0, "body diodes in dead time", 0,
-                             0.0f, 0.0f, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1, -1 };
+                             0.0f, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1, -1 };
     run_closed_loop(&nominal, 1);
     scen_t noisy = nominal; noisy.noise = 2; noisy.name = "ADC noise";
     run_closed_loop(&noisy, 1);
@@ -1204,9 +1049,6 @@ int main(void)
     run_closed_loop(&lmis, 0);
     scen_t vmis = nominal; vmis.vin_plant = 6.5; vmis.name = "plant V_in 6.5 V (model 6 V)";
     run_closed_loop(&vmis, 0);
-    /* The measurement-correction trade-off on the realistic plant (informational). */
-    scen_t a3 = noisy; a3.alpha = 0.3f; a3.name = "alpha_I = 0.3 (tau_c ~ 4.7 us), ADC noise";
-    run_closed_loop(&a3, 0);
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all tests passed", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

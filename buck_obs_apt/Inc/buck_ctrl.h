@@ -567,7 +567,7 @@ BUCK_INLINE uint32_t buck_ctrl_fast(const buck_tune_t *t, buck_state_t *s,
  * of *t). Writes the telemetry to *o except o->i_load (the observer's, buck_iload_obs) and returns g[k].
  * first_order: the score additions' operand order (buck_trigger_score_ko). Since stage 3 there is no
  * prediction here (the Padé estimator is removed); cmp_active still follows the CMP1 written (the TOC
- * request reads it: the duty held in the planning periods). */
+ * frame sets it to the held duty; g_buck.st at a stop). */
 BUCK_INLINE uint32_t buck_ctrl_slow_ko(const buck_tune_t *t, buck_score_k_t sk, buck_state_t *s,
                                        const buck_step_t *st, buck_out_t *o, int first_order)
 {

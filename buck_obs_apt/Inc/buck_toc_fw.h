@@ -62,6 +62,14 @@
 #define BUCK_TOC_PROBE_PASSES   2U
 #define BUCK_TOC_PROBES         6U
 #define BUCK_TOC_EVENTS         32U     /* g_buck.toc.ev */
+/* A pass the TOC code runs after a frame uses its sample only if its wait returned with the Timer A counter in
+ * [BUCK_TOC_F_EARLIEST, BUCK_TOC_PASS_LAST) and both results are there without an overrun; otherwise the sample
+ * is dropped and the next one taken (the CMP1 in force stays a period more), at most BUCK_TOC_DROP_MAX times
+ * (Src/buck_toc.c toc_sample; 31 Oct: on the board that code runs ~1.5 x slower than counted and reached its
+ * samples up to a period late). PASS_LAST leaves 180 clocks to the write deadline: toc_pass, ~90 static from its
+ * sample to its CMP1 write, twice that. */
+#define BUCK_TOC_PASS_LAST      (BUCK_WRITE_DEADLINE - 32U * 180U)
+#define BUCK_TOC_DROP_MAX       3U
 
 enum { BUCK_TOC_RET_STATE = 0U, BUCK_TOC_RET_EXIT = 1U };
 enum { BUCK_TOC_REQ_NONE = 0U, BUCK_TOC_REQ_FRAME = 1U, BUCK_TOC_REQ_FAIL = 2U };

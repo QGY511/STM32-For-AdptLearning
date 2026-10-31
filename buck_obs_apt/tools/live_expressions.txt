@@ -114,3 +114,6 @@ g_buck.toc.pr_c1
 g_buck.toc.pr_st
 g_buck.toc.ev_n
 g_buck.toc.ev
+g_buck.toc.drop_n
+g_buck.toc.t_skip
+g_buck.toc.t_lost

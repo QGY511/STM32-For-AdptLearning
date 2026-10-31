@@ -1020,8 +1020,10 @@ def main():
     #         ldr  rC, [rH, #144]   Timer A CNTR       sub  rL, rC, rE   cmp  rL, rW
     #         it   cc/lo          strcc rV, [rA]      bcs  <miss>
     #     (at least 3: the held duty's CMP1 after the frame, the passes' CMP1 (toc_pass), the return words), and
-    #     the CMP1 writes (in buck_toc_finish and toc_pass) reach toc_fail (fault 5) within 16
-    #     instructions (a bl, or the b.w of a tail call); the only other CMP1 store there is toc_exit's BUCK_CMP_MIN after the gates are off;
+    #     the passes' CMP1 write (toc_pass) reaches toc_fail (fault 5) within 16 instructions (a bl, or the b.w
+    #     of a tail call); T's (buck_toc_finish) is skipped on a miss since 31 Oct (the guard stores nothing
+    #     then: the return words' held duty stays); the only other CMP1 store there is toc_exit's BUCK_CMP_MIN
+    #     after the gates are off;
     #  d. the inline start in run_loop (the HOLD copy, one per order): the guarded software updates of the
     #     same form, whose stored value is MSWU | TASWU (#3) through a register holding HRTIM1 + 0x384
     #     (CR2), at least 4 (two per order); in each order the high side is forced (a store to Timer A
@@ -1089,15 +1091,15 @@ def main():
                     errors.append(f'stage 4: conditional store at 0x{a:08x} ({n}) is not the TOC_GUARD form')
                     continue
                 toc_guarded += 1
-                if n.startswith(('buck_toc_finish', 'toc_pass')):
+                if n.startswith('toc_pass'):
                     if reaches(tgt, fail_fn):
                         toc_guarded_fail += 1
                     else:
                         errors.append(f'stage 4: guarded store at 0x{a:08x} ({n}) does not reach toc_fail')
     if toc_guarded < 3:
         errors.append(f'stage 4: {toc_guarded} TOC guarded writes found in the TOC functions (3 expected at least)')
-    if toc_guarded_fail < 2:
-        errors.append(f'stage 4: {toc_guarded_fail} guarded CMP1 writes of buck_toc_finish and toc_pass reach toc_fail (2 expected)')
+    if toc_guarded_fail < 1:
+        errors.append(f'stage 4: {toc_guarded_fail} guarded CMP1 writes of toc_pass reach toc_fail (1 expected)')
     # d. the inline start in run_loop
     swu = []
     for k, (a, op, args) in enumerate(body):

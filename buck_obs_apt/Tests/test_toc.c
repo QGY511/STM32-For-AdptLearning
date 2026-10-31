@@ -298,10 +298,13 @@ static void plan_normal(span_plan_t *sp, uint32_t cmp, int hs_at_start)
  * linked code (README "Clock budget"), and as measured on the board (31 Oct, one frame: g_buck.toc.c_start,
  * PER' - BUCK_TOC_END_LEAD_TICKS; the solve's read is not measured: 62 clocks x 1.36, the factor measured
  * from the SST to the read after the wait). */
-typedef struct { uint32_t c_s, solve, wait; const char *name; } sim_timing_t;
-static const sim_timing_t SIM_STATIC = { 3350U, 1984U, 32U * 184U, "static count" };
-static const sim_timing_t SIM_BOARD = { 4352U, 32U * 84U, 8064U, "board, measured 31 Oct" };
-static sim_timing_t sim_tm = { 3350U, 1984U, 32U * 184U, "static count" };
+typedef struct { uint32_t c_s, solve, wait, held_learn; const char *name; } sim_timing_t;
+/* held_learn: the periods the duty stays held after P1's sample while the Jacobian step runs (Src/buck_toc.c,
+ * toc_keep; 31 Oct: the TOC code runs no PI pass): none by the static count (the step ends before the next
+ * sample), two with the board's ~2 x */
+static const sim_timing_t SIM_STATIC = { 3350U, 1984U, 32U * 184U, 0U, "static count" };
+static const sim_timing_t SIM_BOARD = { 4352U, 32U * 84U, 8064U, 2U, "board, measured 31 Oct" };
+static sim_timing_t sim_tm = { 3350U, 1984U, 32U * 184U, 0U, "static count" };
 #define SIM_C_S_TICKS     (sim_tm.c_s)
 #define SIM_SOLVE_TICKS   (sim_tm.solve)
 #define SIM_WAIT_TICKS    (sim_tm.wait)
@@ -353,8 +356,10 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
     uint32_t vsum = 0, isum = 0;                /* the samples of the period just run */
     uint32_t trig = 0, holdoff = 0;
     float v_prev = 0.0f;
-    /* the episode: 0 none, 1 = the next pass reads the frame's end (T), 2 = it reads after P1 (1) */
+    /* the episode: 0 none, 1 = the next pass reads the frame's end (T), 2 = it reads after P1 (1), 3 = a sample
+     * read with the duty held (ep_held more) */
     int ep = 0;
+    uint32_t ep_held = 0;
     uint32_t ep_order = 0, ep_tail = 0, ep_sat = 0, ep_ok = 0, ep_t1 = 0, ep_t2 = 0, hold_cmp = 0;
     float ep_a = 0, ep_dhold = 0, ep_g1 = 1, ep_g2 = 1, v_end = 0, ep_ieq = 0;
     double t = 0.0;
@@ -389,14 +394,20 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
             cmp_next = hold_cmp;
             obs.vh = v_end;
             ep = 2;
-        } else if (ep == 2) {                   /* 1: the PIs restart from the first period */
+        } else if (ep == 3) {                   /* a sample while the TOC code still works: the duty held */
+            const float v = (float)vsum * (float)BUCK_V_PER_VSUM;
+            (void)buck_obs_step(&obs, v, buck_adc_to_i(&tune, isum), ok);
+            v_prev = v;
+            cmp_next = hold_cmp;
+            if (--ep_held == 0U) ep = 0;
+        } else if (ep == 2) {                   /* 1: the PIs' integrators from the first period, the duty held */
             const float i1 = buck_adc_to_i(&tune, isum);
             s.integ_v = fminf(fmaxf(i1, BUCK_IREF_MIN_A), BUCK_IREF_MAX_A);
             s.integ_i = ep_dhold;
-            buck_step_t stp; buck_out_t o;
-            cmp_next = buck_ctrl_fast_kt(&tune, ki_t_v, ki_t_i, &s, vsum, isum, &stp);
-            const uint32_t gg = buck_ctrl_slow(&tune, &s, &stp, &o);
-            (void)buck_obs_step(&obs, stp.v, stp.im, ok);
+            buck_step_t stp;
+            stp.v = (float)vsum * (float)BUCK_V_PER_VSUM;
+            cmp_next = hold_cmp;
+            (void)buck_obs_step(&obs, stp.v, i1, ok);
             /* the firmware's residuals (Src/buck_toc.c): the landing and the end voltage for the timing, the load
              * over P1 against I_eq for b */
             const float zv = v_end - vref, zi = i1 - ep_ieq;
@@ -425,8 +436,8 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
             }
             v_prev = stp.v;
             trig = 0; holdoff = BUCK_TOC_HOLDOFF_PASSES;
-            (void)gg;
-            ep = 0;
+            ep_held = (sc->learn && ep_ok && !low) ? sim_tm.held_learn : 0U;
+            ep = ep_held ? 3 : 0;
         } else {
             const float v = (float)vsum * (float)BUCK_V_PER_VSUM;
             const float S = buck_trigger_score_k(v - s.vref, buck_score_k(&tune));

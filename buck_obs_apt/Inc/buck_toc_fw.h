@@ -22,12 +22,13 @@
  *   T    the sample at the frame's end (read in P1): z_v; CMP1 for P2 = the held duty again; the
  *        observer's v^ set to it; the checks of debugger writes to g and b;
  *   1    the sample after P1 (read in P2): the voltage PI's integrator = P1's measured mean current
- *        (user: no reference learner), the current PI's = the held duty, then an ordinary pass (CMP1
- *        for P3, score, observer, A2, D4); the load over P1, I_load = i_P1 - (C/T)(v_1 - v_T): the
- *        equilibrium correction b at once; the landing z_i = i_P1 - I_eq and z_v: the Jacobian step on
- *        the gains in two parts, in the spare tails of the next one or two ordinary passes, which the TOC
- *        code runs itself (toc_pass; the restart pass's tail is too short for the step);
- *   then the normal passes, with run_loop's state taken back from the mailbox. */
+ *        (user: no reference learner), the current PI's = the held duty; the observer step and A2 on it
+ *        (no PI pass, no CMP1 write since 31 Oct: the duty stays held); the load over P1,
+ *        I_load = i_P1 - (C/T)(v_1 - v_T): the equilibrium correction b at once; the landing
+ *        z_i = i_P1 - I_eq and z_v: the Jacobian step on the gains in two parts, a sample that came
+ *        meanwhile read after each with the duty held (toc_keep);
+ *   then the hand-back (BUCK_TOC_KEEP_FIRST): the loop's first pass steps the PIs from those integrators,
+ *   with run_loop's state taken back from the mailbox. */
 
 #include <stdint.h>
 #include "buck_ctrl.h"
@@ -46,30 +47,14 @@
 #endif
 #define BUCK_TOC_ALIGN_TOL      64      /* ticks: allowed change of (Timer A - master) counter read back to back */
 #define BUCK_TOC_F_EARLIEST     1024U   /* a sample after the frame: a counter below this means a period was lost */
-/* The learning after a frame (stage 4b, Src/buck_toc.c): a part of the Jacobian step (~110 clocks static) starts
- * only with the counter below this, so that it ends by ~2048 ticks into the next period; the next pass (the TOC
- * code's own, toc_pass: 90 clocks from its sample to its CMP1 write) then still writes CMP1 ~100 clocks before
- * the deadline. Otherwise the next ordinary pass first, at most LEARN_PASSES of them. */
-#define BUCK_TOC_LEARN_PART_LAST (BUCK_HRTIM_PERIOD + 2048U - 32U * 110U)
-/* ... and not before this: this period's own sample (its end of conversion ~1150 ticks in) comes first, so a part
- * never delays the pass of a sample that is about to arrive. */
-#define BUCK_TOC_LEARN_PART_FIRST 2048U
-#define BUCK_TOC_LEARN_PASSES   4U
-/* After a frame the TOC code runs this many more ordinary passes before it hands back (31 Oct): it hands back at
- * a point where the loop waits for its sample (the residuals end after the next sample's EOC: the loop's first
- * pass then read it late, and on the board the second pass after a frame found ADC2 overrun), and each pass it
- * runs records its samples' arrival (g_buck.toc.pr_*). */
-#define BUCK_TOC_PROBE_PASSES   2U
-#define BUCK_TOC_PROBES         6U
+#define BUCK_TOC_PROBES         6U      /* g_buck.toc.pr_*: the waits after a frame recorded */
 #define BUCK_TOC_EVENTS         32U     /* g_buck.toc.ev */
-/* A pass the TOC code runs after a frame uses its sample only if its wait returned with the Timer A counter in
- * [BUCK_TOC_F_EARLIEST, BUCK_TOC_PASS_LAST) and both results are there without an overrun; otherwise the sample
- * is dropped and the next one taken (the CMP1 in force stays a period more), at most BUCK_TOC_DROP_MAX times
- * (Src/buck_toc.c toc_sample; 31 Oct: on the board that code runs ~1.5 x slower than counted and reached its
- * samples up to a period late). PASS_LAST leaves 180 clocks to the write deadline: toc_pass, ~90 static from its
- * sample to its CMP1 write, twice that. */
-#define BUCK_TOC_PASS_LAST      (BUCK_WRITE_DEADLINE - 32U * 180U)
-#define BUCK_TOC_DROP_MAX       3U
+/* After a frame the TOC code runs no PI pass (31 Oct: on the board its passes took ~210 clocks from the sample to
+ * the CMP1 write, past the deadline, and the samples came ~2000 ticks into the period): a sample that comes while it
+ * still works is read not before this counter (Src/buck_toc.c toc_keep: both results of the period are in by
+ * then), with the held duty kept, and it hands back to the loop only at or after it with the period's sample taken,
+ * so that the loop's first pass gets the next sample early in its period. */
+#define BUCK_TOC_KEEP_FIRST     4096U
 
 enum { BUCK_TOC_RET_STATE = 0U, BUCK_TOC_RET_EXIT = 1U };
 enum { BUCK_TOC_REQ_NONE = 0U, BUCK_TOC_REQ_FRAME = 1U, BUCK_TOC_REQ_FAIL = 2U };

@@ -68,7 +68,7 @@ typedef struct {
     uint32_t learn_skip;        /* frames whose residuals were beyond the SKIP bounds (or learning off) */
     uint32_t b_n;               /* equilibrium corrections taken */
     uint32_t learn_low;         /* frames not learned from: the first period's mean current below LEARN_IMIN */
-    uint32_t learn_late;        /* Jacobian steps dropped: not done within BUCK_TOC_LEARN_PASSES passes */
+    uint32_t learn_late;        /* Jacobian steps dropped for lack of time (none since 31 Oct) */
     /* the last frame */
     uint32_t order;             /* 0 ON-OFF, 1 OFF-ON */
     uint32_t sat;               /* BUCK_TOC_SAT_* */
@@ -95,8 +95,8 @@ typedef struct {
     uint32_t f4_site;           /* 0: none, or the loop's own sample timeout (buck_fatal from a pass or the arming
                                    wait: the CPU then spins in buck_fatal); 1 a pass of the loop: a bad sample
                                    (run_exit); 2 T, the frame-end sample, bad; 3 a pass the TOC code runs (the
-                                   restart pass, a learning pass) bad, 0x1 in f4_bad: still late after
-                                   BUCK_TOC_DROP_MAX drops; 4 the TOC code's sample timeout (toc_wait); 5 the
+                                   restart pass, a learning pass) bad (31 Oct: those passes went, site 3 is a
+                                   STOP after P1's sample); 4 the TOC code's sample timeout (toc_wait); 5 the
                                    period's own A0 result not converted inside the frame (buck_toc_ret's wait);
                                    (31 Oct: T no longer faults on its sample, site 2 is a STOP there) */
     uint32_t f4_bad;            /* sites 1-3, the check's bad bits: 0x10 ADC1 overrun, 0x100000 ADC2 overrun,
@@ -106,12 +106,12 @@ typedef struct {
     uint32_t f4_cnt;            /* Timer A counter there */
     /* Board timing of the last frame (31 Oct; Timer A counter, ticks, 8960 per period; the frame's own counter
      * runs on past 8960 to PER'): the first update's guard, the read after the second update's wait, the second
-     * update's guard, the return words' guard (the frame's counter); T's CMP1 write (P1's counter), the restart
-     * pass's (P2's), the last pass the TOC code ran (c_pass), the counter when the loop takes over (c_back,
-     * the period unknown) and ADC12_COMMON->CSR there (EOC_MST 0x4 set: its sample is already waiting) */
+     * update's guard, the return words' guard (the frame's counter); T's CMP1 write (P1's counter); c_first and
+     * c_pass unused since 31 Oct (no PI pass in the TOC code); the counter when the loop takes over (c_back, the
+     * period unknown) and ADC12_COMMON->CSR there (EOC_MST 0x4 set: its sample is already waiting) */
     uint32_t c_swu1, c2, c_ret, c_t, c_first, c_pass, c_back, csr_back;
-    uint32_t c_tw, c_rw;        /* the Timer A counter when T's sample (P1) and the restart pass's sample (P2)
-                                   arrived (their waits returned) */
+    uint32_t c_tw, c_rw;        /* the Timer A counter when T's sample (P1) and P1's sample (P2) were taken
+                                   (their waits returned) */
     /* buck_fatal (any fault through it, e.g. a sample timeout, fault 4 with f4_site 0; 31 Oct diagnostics): its
      * caller (return address: map it to a function with the .map / disassembly), the fault code before it (a
      * trip the stopped loop then timed out after), and the registers when it stopped: Timer A PER and counter,
@@ -127,13 +127,14 @@ typedef struct {
     /* The event log of the last frame (31 Oct diagnostics; README "Enabling" 8, tools/decode_events.py): from the
      * return words' guard (inside the frame) through the passes the TOC code runs, ev_n entries, each
      * code << 23 | (CPU cycles since the guard, 12 bits) << 11 | Timer A counter / 32. code: 0x100 a wait began,
-     * 0x80 a sample dropped (too late for its pass, or incomplete), 0x10 T's CMP1 write skipped (late), 0x08 T's
+     * 0x80 a sample read with the duty held (toc_keep), 0x10 T's CMP1 write skipped (late), 0x08 T's
      * sample overwritten; with the ADC state there: 0x01 ADC1's result, 0x02 ADC2's, 0x20 / 0x40 their overruns.
      * ev_cyc0: CYCCNT at the guard */
     uint32_t ev_n, ev_cyc0;
     uint32_t ev[32];
-    /* After frames (31 Oct; cumulative): samples the TOC code's passes dropped (BUCK_TOC_PASS_LAST), T's CMP1
-     * writes skipped (outside their window), T's samples overwritten (no learning from those frames) */
+    /* After frames (31 Oct; cumulative): samples read with the held duty kept beyond P1's (toc_keep: the TOC code
+     * still worked; the loop's PIs restart a period later for each), T's CMP1 writes skipped (outside their
+     * window), T's samples overwritten (no learning from those frames) */
     uint32_t drop_n, t_skip, t_lost;
 } buck_toc_t;
 

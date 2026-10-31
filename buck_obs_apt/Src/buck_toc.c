@@ -79,7 +79,7 @@ static TOC_COLD void toc_fail(buck_t *b, uint32_t code, uint32_t cnt)
 _Static_assert(sizeof(g_buck.toc.ev) / sizeof(g_buck.toc.ev[0]) == BUCK_TOC_EVENTS, "event log size");
 #define EV_TLOST  0x008U    /* T's sample overwritten (ADC1 overrun): no learning from this frame */
 #define EV_TSKIP  0x010U    /* T's CMP1 write outside its window: skipped */
-#define EV_DROP   0x080U    /* a pass's sample too late for its CMP1 write, or incomplete: dropped */
+#define EV_HELD   0x080U    /* a sample read with the held duty kept (toc_keep) */
 #define EV_START  0x100U    /* a wait began */
 
 /* ADC12_COMMON->CSR as the log's state: ADC1's result 0x01, ADC2's 0x02, ADC1 overrun 0x20, ADC2 overrun 0x40 */
@@ -126,35 +126,6 @@ static TOC_CODE uint32_t toc_wait(uint32_t *cnt)
     return st;
 }
 
-/* The sample of a pass the TOC code runs (31 Oct): used only if the wait returned with the Timer A counter in
- * [BUCK_TOC_F_EARLIEST, BUCK_TOC_PASS_LAST) (the pass's CMP1 write then meets its deadline) and both results are
- * there without an overrun. Otherwise dropped, and the next one taken: the CMP1 in force (the held duty after a
- * frame) stays one period more. On the board the code after a frame runs ~1.5 x slower than counted and reached
- * its samples up to a period late: T's ADC2 read raced the next group (fault 4), a CMP1 write missed its window
- * (fault 5). A drop late in the period takes both results (ADC2's group of this period goes with ADC1's pair);
- * early in the period (before F_EARLIEST, ADC1's result is the last period's) ADC2's is kept when it overran (its
- * data register then holds this period's group). Returns 0 with the data registers read, else the bad bits
- * (ADC12_COMMON->CSR; 0x1: still late after BUCK_TOC_DROP_MAX drops). */
-static TOC_CODE uint32_t toc_sample(buck_toc_t *T, uint32_t *adc_v, uint32_t *adc_i4)
-{
-    for (uint32_t k = 0U; ; ++k) {
-        uint32_t c;
-        const uint32_t st = toc_wait(&c);
-        const uint32_t bad = (st & CSR_BAD) ^ ADC_CSR_EOC_SLV;
-        const uint32_t on_time = c - BUCK_TOC_F_EARLIEST < BUCK_TOC_PASS_LAST - BUCK_TOC_F_EARLIEST;
-        if ((bad == 0U && on_time) || k == BUCK_TOC_DROP_MAX) {
-            *adc_v = ADC1->DR; *adc_i4 = ADC2->DR;
-            return (bad == 0U && on_time) ? 0U : (bad | ADC_CSR_ADRDY_MST);
-        }
-        (void)ADC1->DR;
-        if (!(c < BUCK_TOC_F_EARLIEST && (st & ADC_CSR_OVR_SLV))) (void)ADC2->DR;
-        ADC1->ISR = ADC_ISR_OVR;
-        ADC2->ISR = ADC_ISR_OVR;
-        toc_ev(EV_DROP | toc_ev_state(st));
-        ++T->drop_n;
-    }
-}
-
 /* (Timer A counter) - (master counter), read back to back: a constant while the grid is locked. */
 static TOC_CODE int32_t toc_align(void)
 {
@@ -179,48 +150,26 @@ static TOC_CODE void toc_gains_take(buck_toc_mb_t *m, const buck_toc_t *T)
     m->g2[BUCK_TOC_OFF_ON] = buck_toc_gain_ok(T->g[BUCK_TOC_OFF_ON][0]);    /* g_on */
 }
 
-/* An ordinary pass run by the TOC code (the passes after a frame): the next sample in time (toc_sample), both
- * PIs, CMP1 through the guard (a miss: fault 5, as in the loop), the score, the observer, A2, D4. reseed (the
- * restart pass, user): the voltage PI's integrator := the measured mean current (clamped), the current
- * PI's := d_hold, before the PIs. *v_out, *i_out: the sample's v_out and measured mean current.
- * Returns 1 when the run ended (a STOP, a bad sample, a missed guard: m->ret = EXIT), else 0. */
-static TOC_CODE uint32_t toc_pass(buck_toc_mb_t *m, buck_t *b, const buck_tune_t *t, uint32_t reseed, float d_hold,
-                                  float *v_out, float *i_out)
+/* A sample that comes while the TOC code still works after a frame (31 Oct: that code runs no PI pass any more; on
+ * the board its passes took ~210 clocks from the sample to the CMP1 write, past the deadline, and its samples came
+ * ~2000 ticks into the period): read, not before BUCK_TOC_KEEP_FIRST (both results of the period are in by then,
+ * a pair whatever overran before; the overruns cleared), the observer stepped on it, A2; no CMP1 write (the held
+ * duty stays). Returns 1 if there was one. */
+static TOC_CODE uint32_t toc_keep(buck_toc_mb_t *m, buck_t *b, const buck_tune_t *t)
 {
-    const buck_kc_t kc = buck_kc_init();
-    uint32_t cnt, adc_v, adc_i4;
-    const uint32_t bad = toc_sample(&b->toc, &adc_v, &adc_i4);
-    if (reseed) b->toc.c_rw = b->toc.pr_c1[b->toc.pr_n - 1U];  /* diagnostics: the restart pass's sample (its wait) */
-    const uint32_t cmd = *(volatile const uint32_t *)&b->command;
-    if (bad || cmd != BUCK_RUN) { toc_exit(b, bad, adc_v, adc_i4, 3U); return 1U; }
-    if (reseed) {
-        float iref0 = buck_adc_to_i_o(t, adc_i4, 0);
-        iref0 = (iref0 > BUCK_IREF_MIN_A) ? iref0 : BUCK_IREF_MIN_A;   /* (a NaN ends at the lower bound) */
-        iref0 = (iref0 < BUCK_IREF_MAX_A) ? iref0 : BUCK_IREF_MAX_A;
-        m->s.integ_v = iref0;
-        m->s.integ_i = d_hold;
-        b->toc.i_first = iref0;
-    }
-    buck_step_t stp;
-    buck_fast_pend_t pd;
-    const uint32_t cmp = buck_ctrl_fast_pre_kc(t, m->ki_t_v, m->ki_t_i, &m->s, adc_v, adc_i4, &stp, &pd, &kc, 0);
-    {
-        const uint32_t early = BUCK_TOC_F_EARLIEST, win = BUCK_WRITE_DEADLINE - BUCK_TOC_F_EARLIEST;
-        TOC_GUARD(cmp, &TA.CMP1xR, early, win, cnt, late);
-    }
-    b->toc.c_pass = cnt;                        /* board timing: this pass's CMP1 write */
-    buck_ctrl_fast_commit(&m->s, &stp, &pd);
-    buck_out_t o;
-    const uint32_t g = buck_ctrl_slow_ko(t, m->sk, &m->s, &stp, &o, 0);
-    DAC1->DHR12R1 = buck_iload_dac(buck_obs_step_a(&m->obs, stp.v, stp.im, m->ok, BUCK_OBS_A));
-    GPIOB->BSRR = g ? D4_PIN : D4_PIN << 16;
+    if (!(ADC12_COMMON->CSR & ADC_CSR_EOC_MST)) return 0U;
+    while (TA.CNTxR < BUCK_TOC_KEEP_FIRST) {}
+    const uint32_t st = ADC12_COMMON->CSR;
+    const uint32_t adc_v = ADC1->DR, adc_i4 = ADC2->DR;
+    ADC1->ISR = ADC_ISR_OVR;
+    ADC2->ISR = ADC_ISR_OVR;
+    const float v = (float)adc_v * VSUM;
+    DAC1->DHR12R1 = buck_iload_dac(buck_obs_step_a(&m->obs, v, buck_adc_to_i_o(t, adc_i4, 0), m->ok, BUCK_OBS_A));
+    m->v_prev = v;
     m->loops += 1U;
-    m->v_prev = stp.v;
     b->adc_v_raw = adc_v; b->adc_i4_raw = adc_i4;
-    *v_out = stp.v; *i_out = stp.im;
-    return 0U;
-late:
-    toc_fail(b, BUCK_FAULT_DEADLINE, cnt);
+    ++b->toc.drop_n;
+    toc_ev(EV_HELD | toc_ev_state(st));
     return 1U;
 }
 
@@ -375,20 +324,40 @@ TOC_CODE void buck_toc_finish(void)
         if (cmd != BUCK_RUN) { toc_exit(b, 0U, adc_v, b->adc_i4_raw, 2U); return; }
     }
 
-    /* ---- 1: the sample after the first period: the PIs restart from it (user: the voltage PI's
-     * integrator = the first period's measured mean current, no reference learner; the current PI's
-     * = the held duty), an ordinary pass otherwise */
+    /* ---- 1: the sample after the first period: the PIs' integrators from it (user: the voltage PI's = the first
+     * period's measured mean current, no reference learner; the current PI's = the held duty). 31 Oct: no PI pass
+     * here (on the board the TOC code's took ~210 clocks from the sample to the CMP1 write, past the deadline):
+     * the duty stays held, the loop's first pass after the hand-back steps the PIs from these integrators */
     T->state = BUCK_TOCS_FIRST;
-    buck_tune_t t;                              /* the loop's held tunables, the fields the pass uses */
-    t.kp_v = m->kp_v; t.kp_i = m->kp_i; t.isense_zero = m->isense_zero; t.isense_gain = m->isense_gain;
-    t.s_th = m->s_th;
+    buck_tune_t t;                              /* the loop's held tunables, the fields used here */
+    t.isense_zero = m->isense_zero; t.isense_gain = m->isense_gain;
     float v1, i1;
     {
-        const uint32_t d0 = T->drop_n;
-        if (toc_pass(m, b, &t, 1U, d_hold, &v1, &i1)) return;
-        if (T->drop_n != d0) lost = 1U;         /* not P1's sample: the residuals would not be the frame's */
+        uint32_t c;
+        const uint32_t st = toc_wait(&c);
+        T->c_rw = c;                            /* diagnostics (31 Oct): the sample taken (P2's counter) */
+        const uint32_t adc_v = ADC1->DR, adc_i4 = ADC2->DR;
+        const uint32_t cmd = *(volatile const uint32_t *)&b->command;
+        if (st & (ADC_CSR_OVR_MST | ADC_CSR_OVR_SLV)) {   /* not P1's sample (or not its current): no learning */
+            ADC1->ISR = ADC_ISR_OVR;
+            ADC2->ISR = ADC_ISR_OVR;
+            lost = 1U;
+        }
+        if (!(st & ADC_CSR_EOC_SLV)) lost = 1U;
+        b->adc_v_raw = adc_v; b->adc_i4_raw = adc_i4;
+        if (cmd != BUCK_RUN) { toc_exit(b, 0U, adc_v, adc_i4, 3U); return; }
+        v1 = (float)adc_v * VSUM;
+        i1 = buck_adc_to_i_o(&t, adc_i4, 0);
+        float iref0 = (st & ADC_CSR_EOC_SLV) ? i1 : f->sol.ieq;
+        iref0 = (iref0 > BUCK_IREF_MIN_A) ? iref0 : BUCK_IREF_MIN_A;   /* (a NaN ends at the lower bound) */
+        iref0 = (iref0 < BUCK_IREF_MAX_A) ? iref0 : BUCK_IREF_MAX_A;
+        m->s.integ_v = iref0;
+        m->s.integ_i = d_hold;
+        T->i_first = iref0;
+        DAC1->DHR12R1 = buck_iload_dac(buck_obs_step_a(&m->obs, v1, i1, m->ok, BUCK_OBS_A));
+        m->v_prev = v1;
+        m->loops += 1U;
     }
-    T->c_first = T->c_pass;                     /* board timing: the restart pass's CMP1 write, P2's counter */
     /* the residuals (Inc/buck_toc.h): the landing and the end voltage for the timing, the load over P1
      * against the equilibrium the frame was solved for for b (stage 4b) */
     const float ieq = f->sol.ieq;
@@ -400,47 +369,33 @@ TOC_CODE void buck_toc_finish(void)
     if (learn && low) ++T->learn_low;
     /* the equilibrium correction at once (a few clocks) */
     if (learn && !low && !lost && buck_toc_learn_b(e_b, &T->b[f->order])) { m->b[f->order] = T->b[f->order]; ++T->b_n; }
-    /* the Jacobian step in two parts, each in the spare tail of a pass this code runs (the restart pass's
-     * tail is too short for it: README "Clock budget"), only while the counter leaves a part's time before
-     * the next sample; otherwise the next sample's ordinary pass first (at most BUCK_TOC_LEARN_PASSES) */
-    uint32_t part = (learn && f->ok && !low && !lost) ? 1U : 3U;    /* 1: the span steps, 2: the gains, 3: done */
-    buck_toc_dt_t d;
-    const float t1s = (float)f->t1 * (float)BUCK_TICK_S, t2s = (float)f->t2 * (float)BUCK_TICK_S;
-    const uint32_t sat1 = (f->sat & (BUCK_TOC_SAT_LIMIT1 | BUCK_TOC_SAT_LATE1)) != 0U;
-    const uint32_t sat2 = (f->sat & (BUCK_TOC_SAT_LIMIT2 | BUCK_TOC_SAT_PER)) != 0U;
-    for (uint32_t n = 0U; part < 3U; ) {
-        const uint32_t c = TA.CNTxR;
-        if (c >= BUCK_TOC_LEARN_PART_FIRST && c < BUCK_TOC_LEARN_PART_LAST && !(ADC12_COMMON->CSR & ADC_CSR_EOC_MST)) {
-            if (part == 1U) {
-                part = buck_toc_learn_dt(&m->k, f->order, f->sol.a, t1s, t2s, sat1, zi, zv, &d) ? 2U : 4U;
-            } else {
-                float g1 = f->g1, g2 = f->g2;
-                buck_toc_learn_g(t1s, t2s, sat1, sat2, &d, &g1, &g2);
-                if (f->order == BUCK_TOC_ON_OFF) { T->g[0][0] = g1; T->g[0][1] = g2; }
-                else                             { T->g[1][1] = g1; T->g[1][0] = g2; }
-                m->g1[f->order] = g1; m->g2[f->order] = g2;     /* in range by construction (buck_toc_gclip) */
-                ++T->learn_n;
-                part = 3U;
-            }
-        } else if (n < BUCK_TOC_LEARN_PASSES) {
-            if (toc_pass(m, b, &t, 0U, 0.0f, &v1, &i1)) return;
-            ++n;
+    /* the Jacobian step in its two parts, a sample that came meanwhile read after each (toc_keep: the duty stays
+     * held until the loop takes over) */
+    if (learn && f->ok && !low && !lost) {
+        buck_toc_dt_t d;
+        const float t1s = (float)f->t1 * (float)BUCK_TICK_S, t2s = (float)f->t2 * (float)BUCK_TICK_S;
+        const uint32_t sat1 = (f->sat & (BUCK_TOC_SAT_LIMIT1 | BUCK_TOC_SAT_LATE1)) != 0U;
+        const uint32_t sat2 = (f->sat & (BUCK_TOC_SAT_LIMIT2 | BUCK_TOC_SAT_PER)) != 0U;
+        const uint32_t pair = buck_toc_learn_dt(&m->k, f->order, f->sol.a, t1s, t2s, sat1, zi, zv, &d);
+        (void)toc_keep(m, b, &t);
+        if (pair) {
+            float g1 = f->g1, g2 = f->g2;
+            buck_toc_learn_g(t1s, t2s, sat1, sat2, &d, &g1, &g2);
+            if (f->order == BUCK_TOC_ON_OFF) { T->g[0][0] = g1; T->g[0][1] = g2; }
+            else                             { T->g[1][1] = g1; T->g[1][0] = g2; }
+            m->g1[f->order] = g1; m->g2[f->order] = g2;     /* in range by construction (buck_toc_gclip) */
+            ++T->learn_n;
+            (void)toc_keep(m, b, &t);
         } else {
-            ++T->learn_late;                    /* not done within the passes: dropped */
-            break;
+            ++T->learn_skip;                    /* no pair */
         }
     }
-    if (part != 3U) ++T->learn_skip;            /* off, a low current, no pair, beyond SKIP, or late */
-    /* the extra passes (BUCK_TOC_PROBE_PASSES): hand back where the loop waits for its sample */
-    for (uint32_t n = 0U; n < BUCK_TOC_PROBE_PASSES; ++n)
-        if (toc_pass(m, b, &t, 0U, 0.0f, &v1, &i1)) return;
-    /* debugger writes of g / b, for the next frame (the learning above writes its results directly): only with
-     * a part's time to spare, as a learning part (31 Oct: in P1 after T, ~100 clocks static and more on the
-     * board, it delayed every pass after it); else at the next edge's end or the run's entry */
-    {
-        const uint32_t c = TA.CNTxR;
-        if (c >= BUCK_TOC_LEARN_PART_FIRST && c < BUCK_TOC_LEARN_PART_LAST && !(ADC12_COMMON->CSR & ADC_CSR_EOC_MST))
-            toc_gains_take(m, T);
+    /* the hand-back where the loop waits for a sample of its own: this period's taken (or, before
+     * BUCK_TOC_KEEP_FIRST, its arrival awaited and taken), so that the loop's first pass gets the next one early in
+     * its period. Debugger writes of g / b are taken at the next edge's end or the run's entry */
+    for (;;) {
+        if (toc_keep(m, b, &t)) continue;
+        if (TA.CNTxR >= BUCK_TOC_KEEP_FIRST) break;
     }
     /* board timing: the counter when the loop takes over, and whether its sample is already waiting */
     T->c_back = TA.CNTxR;

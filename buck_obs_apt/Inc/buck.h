@@ -103,6 +103,12 @@ typedef struct {
                                    missing) */
     uint32_t f4_csr;            /* ADC12_COMMON->CSR there (sites 1-3 after the data reads: EOC bits cleared) */
     uint32_t f4_cnt;            /* Timer A counter there */
+    /* Board timing of the last frame (31 Oct; Timer A counter, ticks, 8960 per period; the frame's own counter
+     * runs on past 8960 to PER'): the first update's guard, the read after the second update's wait, the second
+     * update's guard, the return words' guard (the frame's counter); T's CMP1 write (P1's counter), the restart
+     * pass's (P2's), the last pass the TOC code ran (c_pass), the counter when the loop takes over (c_back,
+     * the period unknown) and ADC12_COMMON->CSR there (EOC_MST 0x4 set: its sample is already waiting) */
+    uint32_t c_swu1, c2, c_ret, c_t, c_first, c_pass, c_back, csr_back;
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.

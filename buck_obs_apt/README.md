@@ -127,6 +127,20 @@ P3's CMP1 write to within a few clocks of its deadline (more with wait states). 
 `g` and `b` (`toc_gains_take`, ~100 clocks) run in P1 after T's CMP1 write (31 Oct; before the frame's end they
 could push a short frame's T pass toward its deadline).
 
+**31 Oct, on the board: the start runs ~1.4 x slower than counted, and a tail compare was missed (+27 A).** The
+first frame on the board (an OFF-ON, `score_a` 100, `sat` 29) had its SST at 4352 ticks (counted: ~3350) and its
+read after the wait at 12416 (`per_ticks` 18048 - 5632; counted: ~10200): 252 clocks from the SST against 185. The
+second update then came at the tail's compare (12416 + 2048) and missed it; the high side stayed on from ~10130
+ticks to P1's CMP1, ~1.7 us, and P1's current was ~26 A (`z_i` 27 A, `i_first` clamped at 10); a fault 4 followed in
+the loop (not yet located: `toc.f4_*`). Since then: the ON span is ended at once by software (SRT, `sat` 32) when
+its solved end is not at least 80 clocks (`BUCK_TOC_TAIL_LEAD_TICKS`) beyond the read; else by the compare, and the
+counter is checked right after the update: near or past the compare, SRT (`sat` 64). The budgets are the static
+paths x ~1.5: the return words 192 clocks (`BUCK_TOC_END_LEAD_TICKS` 6656), the provisional frame 384 clocks after
+the SST (at 336 that frame's update would have come after it with the check), the tail's lead 80. `toc_gains_take`
+runs only with a part's time to spare at the episode's end (in P1 it delayed every pass after T). The Timer A
+counter at each step is now recorded (`toc.c_swu1`, `c2`, `c_swu2`, `c_ret`, `c_t`, `c_first`, `c_pass`, `c_back`,
+`csr_back`): the next frame on the board measures the path instead of the count.
+
 **31 Oct: the frame's end was too early for the return words.** Until 31 Oct PER' had to be only the A0 lead + one
 guard (3482 ticks, ~93 clocks) after c2, but from c2 to the return words' guard read were ~158 clocks static (the
 second update, the record stores, BUCK_TOC_CALL's FP save, the held duty inside `buck_toc_ret`), and the second
@@ -157,6 +171,19 @@ firmware's frame timing; S = (e_v/20 mV)^2)
 
 The 0.5 A step up is worse with the TOC than without: its ideal on-time is far below the minimum first span
 (0.51 us), and the second span cannot take the excess out in time (Known limits).
+
+With the start's timing measured on the board (31 Oct: SST at 4352, the read after the wait 8064 ticks later, the
+solve's read 84 clocks after the SST; `make toc-test` runs both timings):
+
+| case | PI alone | TOC (board timing) | learned (16 steps) |
+|---|---|---|---|
+| 1 -> 2 -> 1 A | 72 / 70 mV | **96** / 22 mV | not learned: P1's current 0.35 A, below the gate |
+| 1 -> 3 -> 1 A | 132 / 132 mV | 114 / 34 mV | 26 / 34 mV |
+| 1 -> 6 -> 1 A | 304 / 307 mV | 170 / 65 mV | |
+| 10 us slewing (2 A) | | 137 / 44 mV | 31 / 35 mV |
+
+The first span cannot be shorter than ~0.64 us there: every step up drives the current to the 10 A limit before
+the second span takes it back. The down steps gain from the tail (humps 22-34 mV).
 
 Learning (timing and b) over 16 load cycles, the last step against the same step without learning (dip / hump):
 
@@ -192,11 +219,13 @@ Known limits
 - The minimum first span is the solve's time (~0.51 us): smaller ideal on-times overshoot (then the second span
   lands the current; z_v carries the excess). A 0.5 A step up comes out worse than with the PI alone (63 against
   36 mV in simulation).
-- The frame lasts at least until c2 + 5632 ticks (~2.7 us after the period start): a shorter solved frame is
-  stretched, ON-OFF with a longer fall, OFF-ON with the tail (the ON span as solved, then the low side on). If the
-  solved ON span ends before c2 + 2048 it is lengthened to there; if the second update comes later than the
-  tail's compare (wait states beyond the 18-clock margin), the compare passes unseen and the high side stays on
-  to the frame's end, the frame as before the tail (no fault).
+- The frame lasts at least until c2 + 6656 ticks (c2 ~12400 on the board): a shorter solved frame is stretched,
+  ON-OFF with a longer fall, OFF-ON with the tail (the ON span as solved or ended at once, then the low side on).
+- On the board the start barely fits its period: SST ~4352 (`BUCK_TOC_START_LAST` 4672), the first update ~8190
+  (its limit 8256 before the backstop): expect LATE rejects (`rej[0]`). The minimum first span is ~0.64 us: a small
+  step up overshoots to the 10 A limit (the 1 A step up worse than the PI alone, and not learnable).
+- The edge estimate can be far off on the board: that frame had I_eq = -0.88 A (a negative load) from one
+  cycle's dv after a late trigger (`score_a` 100: |e_v| >= 100 mV, when the PI had already cut the current).
 - x0 is the sample at the period start (~0.6 us before the SST): the droop in between is not in the model (the
   learner takes the systematic part).
 - The lossless model's fall is too shallow on the board (r_L i): g_off learns it (~0.7 in simulation).
@@ -225,6 +254,9 @@ Enabling (Live Expressions, after RUN)
    frame), `toc.f4_bad` which check (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2 without a result),
    `toc.f4_csr` and `toc.f4_cnt` the ADC status and the Timer A counter there; with `toc.state`, `edges`,
    `frames`, `sat`, `c_start`, `per_ticks` and `adc_miss` (counted for sites 1-3 only).
+5. The frame's timing on the board (Timer A counter, ticks): `toc.c_start` (SST), `c_swu1`, `c2`, `c_swu2`,
+   `c_ret` (the frame's counter), `c_t` (T's CMP1, in P1), `c_first` (the restart pass's, in P2), `c_pass`, `c_back`
+   and `csr_back` (where the loop takes over; 0x4 set: its sample already waiting).
 `tools/live_expressions.txt` has the rows.
 
 HRTIM configuration (all builds)

@@ -329,30 +329,33 @@ _Static_assert(BUCK_ISAMPLE_CMP(0) >= 96U && BUCK_ISAMPLE_CMP(3) < BUCK_HRTIM_PE
 #define BUCK_TOC_PER_MIN_TICKS   (BUCK_ISAMPLE_CMP(3U) + 600U)
 #define BUCK_TOC_A0_LEAD_TICKS   (BUCK_VSAMPLE_LEAD_TICKS + BUCK_VSAMPLE_GAP_TICKS)   /* 2458: CMP4' = PER' - this */
 /* The provisional frame of the first update ends this far after the start: the second update (after
- * BUCK_TOC_SWU2_FIRST and its path, at the latest ~231 clocks after the SST static, ~290 with wait states;
- * README "Clock budget") must come before it (its guard: a miss is fault 9). 31 Oct: 320 -> 336 clocks, the
- * held duty before the wait and the pessimistic path from it. */
-#define BUCK_TOC_PER0_REL_TICKS  (32U * 336U)
+ * BUCK_TOC_SWU2_FIRST and its path) must come before it (its guard: a miss is fault 9). On the board (31 Oct,
+ * one frame) the read after the wait came 252 clocks after the SST (185 counted statically, x 1.36); with the
+ * update's path (52 clocks static with the tail, ~73 on the board) ~330, 356 at x 1.5. 320 -> 384 clocks: at
+ * 336 that frame's update with today's tail check would have come after the provisional end. */
+#define BUCK_TOC_PER0_REL_TICKS  (32U * 384U)
 /* Timer A CMP2 in normal periods, a reset source of the high side (RST1R = CMP1 | CMP2): a no-op there
  * (the high side is off from CMP1 <= BUCK_CMP_MAX + DT on), and the end of a forced on-time if the
  * first update does not come (only a stalled CPU: every guard miss ends the span at once; do not halt
  * with the stage energized). Late in the period so that it never binds a running start. */
 #define BUCK_TOC_CMP2_BACKSTOP   (BUCK_HRTIM_PERIOD - 640U)
 #define BUCK_TOC_RET_GUARD_TICKS 512U       /* the return words' last store at least 16 clocks before PER' */
-/* After the counter read that follows the second update's wait (31 Oct), README "Clock budget":
- *   SWU2_PATH: to the second update: 29-34 clocks static (46 with the OFF-ON tail), up to 9 HRTIM
- *              accesses: 73 with 3 wait clocks each; the moved A0 pair's first trigger lies at least
- *              this far after the read;
- *   RET_PATH:  to buck_toc_ret()'s guard read: 77-82 clocks static (94 with the tail), up to 18 HRTIM
- *              accesses: 148 with 3 wait clocks each.
+/* After the counter read that follows the second update's wait (31 Oct), README "Clock budget". The board
+ * runs this code ~1.4 x slower than counted statically (31 Oct, one frame: from the SST to this read 252
+ * clocks against 185), so the budgets are the static paths x ~1.5:
+ *   SWU2_PATH: to the second update: 30-31 clocks static, 48-52 with the OFF-ON tail; the moved A0 pair's
+ *              first trigger lies at least this far after the read, and the tail's compare (TAIL_LEAD);
+ *   RET_PATH:  to buck_toc_ret()'s guard read: 83-84 clocks static, 117 with the tail and its check
+ *              taken (~165 on the board).
  * The frame's end PER' at least END_LEAD after the read (a miss of the return words' guard is fault 9). Until 31 Oct the bound was the A0 lead + one guard (3482 ticks, ~93 clocks)
  * against ~158 clocks static to the return words' guard: a frame ending there tripped fault 9. */
 #define BUCK_TOC_SWU2_PATH_TICKS (32U * 80U)
-/* The OFF-ON tail's earliest end (Inc/buck_toc_start.h), after the same read: the static path (46 clocks)
- * and 18 clocks of wait states, not the pessimistic budget above. A later update only lets the compare
- * pass unseen: the high side then stays on to the frame's end (the frame as before the tail), no fault. */
-#define BUCK_TOC_TAIL_LEAD_TICKS (32U * 64U)
-#define BUCK_TOC_RET_PATH_TICKS  (32U * 160U)
+/* The OFF-ON tail's compare (Inc/buck_toc_start.h) lies at least this far after the same read; a solved ON
+ * end nearer than that is ended at once by software (SRT). A compare the update takes too late would pass
+ * unseen and leave the high side on into P1 (31 Oct, on the board: +27 A with 64 clocks here): the start
+ * checks the counter after the update and ends the span by SRT if it is near or past the compare. */
+#define BUCK_TOC_TAIL_LEAD_TICKS BUCK_TOC_SWU2_PATH_TICKS
+#define BUCK_TOC_RET_PATH_TICKS  (32U * 192U)
 #define BUCK_TOC_END_LEAD_TICKS  (BUCK_TOC_RET_PATH_TICKS + BUCK_TOC_RET_GUARD_TICKS)
 _Static_assert(BUCK_TOC_END_LEAD_TICKS >= BUCK_TOC_A0_LEAD_TICKS + BUCK_TOC_SWU2_PATH_TICKS,
                "the moved A0 pair's first trigger (PER' - A0 lead) comes after the second update");
@@ -361,7 +364,7 @@ _Static_assert(BUCK_TOC_PER_MIN_TICKS < BUCK_HRTIM_PERIOD + BUCK_TOC_A0_LEAD_TIC
 _Static_assert(BUCK_TOC_START_LAST + 32U * 64U + BUCK_TOC_TON_MAX_TICKS + BUCK_TOC_TOFF_MAX_TICKS < BUCK_TOC_PER_MAX_TICKS &&
                BUCK_TOC_START_LAST + BUCK_TOC_PER0_REL_TICKS < BUCK_TOC_PER_MAX_TICKS, "TOC frame range");
 _Static_assert(BUCK_ISAMPLE_CMP(0U) + BUCK_TOC_PER0_REL_TICKS > BUCK_TOC_SWU2_FIRST + BUCK_TOC_SWU2_PATH_TICKS + BUCK_TOC_RET_GUARD_TICKS &&
-               BUCK_TOC_PER0_REL_TICKS > 32U * 290U + BUCK_TOC_RET_GUARD_TICKS,
+               BUCK_TOC_PER0_REL_TICKS > 32U * 356U + BUCK_TOC_RET_GUARD_TICKS,
                "the provisional frame outlasts the second update (earliest start: its wait and path; latest: its path)");
 _Static_assert(BUCK_TOC_CMP2_BACKSTOP > BUCK_CMP_MAX + BUCK_DT_TICKS + 96U && BUCK_TOC_CMP2_BACKSTOP < BUCK_HRTIM_PERIOD,
                "the CMP2 backstop is a no-op in a normal period");

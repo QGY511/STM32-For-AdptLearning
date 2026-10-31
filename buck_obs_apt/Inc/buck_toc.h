@@ -40,8 +40,12 @@ enum {                          /* what clamped a frame (g_buck.toc.sat) */
     BUCK_TOC_SAT_LIMIT2 = 4U,   /* second span at its limit (minimum, maximum, the frame's range) */
     BUCK_TOC_SAT_PER = 8U,      /* the frame's end moved later (its minimum: the second update's and the return
                                    words' path, BUCK_TOC_END_LEAD_TICKS; master CMP4 + 600) */
-    BUCK_TOC_SAT_TAIL = 16U     /* with PER, OFF-ON: the ON span ended as solved (Timer A CMP1, reset source from
+    BUCK_TOC_SAT_TAIL = 16U,    /* with PER, OFF-ON: the ON span ended as solved (Timer A CMP1, reset source from
                                    the second update), the rest of the frame with the low side on (31 Oct) */
+    BUCK_TOC_SAT_TAIL_NOW = 32U,/* with TAIL: the solved end was not far enough ahead of the second update: the ON
+                                   span ended by software (SRT) at the counter read before it */
+    BUCK_TOC_SAT_TAIL_SRT = 64U /* with TAIL: the counter after the second update was near or past the tail's
+                                   compare (it may have passed unseen): SRT then */
 };
 
 /* VSQRT on the target (sqrtf would be a library call that sets errno for x < 0). */

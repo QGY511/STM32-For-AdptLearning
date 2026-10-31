@@ -69,7 +69,11 @@ typedef struct {
     uint32_t hold_cmp;          /* CMP1 of the held duty (with DT: P2) */
     uint32_t ret_cmp1;          /* P1's CMP1 (the return words): hold_cmp, after OFF-ON without DT (with the
                                    tail with it) */
-    uint32_t t_end;             /* SAT_TAIL: the ON span's end (Timer A CMP1, the frame's counter) */
+    uint32_t t_end;             /* SAT_TAIL: the ON span's end (Timer A CMP1, the frame's counter; with TAIL_NOW
+                                   the counter read at which it was ended) */
+    uint32_t t_chk;             /* the tail's compare to check after the second update (0: none) */
+    uint32_t c_swu1, c2, c_swu2, c_ret;   /* Timer A counter at the first update's guard, the read after the
+                                   wait, the second update's guard, the return words' guard (board timing) */
     float d_hold;               /* the held duty */
     uint32_t v_mid_code;        /* the period's own A0 pair, converted inside the frame (dropped; telemetry): its
                                    ADC1 code (buck_toc_ret has no floating point: BUCK_TOC_CALL_CORE) */

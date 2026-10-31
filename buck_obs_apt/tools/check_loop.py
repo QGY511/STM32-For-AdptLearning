@@ -236,22 +236,22 @@ def arming_writes(body, cands):
 def toc_tail_writes(body, cands):
     """Stage 4 (31 Oct): the unguarded stores to [rB, #156] among cands that are the OFF-ON frame's tail
     compare (Inc/buck_toc_start.h: a frame stretched to its minimum ends its ON span with Timer A CMP1):
-    a register loaded with #8 (HRTIM_RST1R_CMP1) within the 6 instructions before, and followed within
-    three instructions, with no other store between (but to the stack), by a store of that register to
-    [rB, #192] (Timer A RST1R) through the same base. Inside a frame CMP1 is that reset only; the deadline check is the
+    followed within five instructions, with no other store between (but to the stack), by a store to
+    [rB, #192] (Timer A RST1R) through the same base of a register loaded with #8 (HRTIM_RST1R_CMP1) within
+    the 6 instructions before that store. Inside a frame CMP1 is that reset only; the deadline check is the
     passes'. Rule 5d checks that it is on the way to a guarded software update."""
     out = []
     for i in cands:
         m = re.match(REGN + r', \[' + REGN + r', #156\]$', body[i][2])
         if not m:
             continue
-        for k in range(i + 1, min(i + 4, len(body))):
+        for k in range(i + 1, min(i + 6, len(body))):
             op, args = body[k][1], body[k][2]
             r = re.match(REGN + r', \[' + m.group(2) + r', #192\]$', args)
             if op.startswith('str') and r:
                 reg = r.group(1)
                 if any(body[j][1].startswith('mov') and body[j][2].replace(' ', '') == f'{reg},#8'
-                       for j in range(max(0, i - 6), i)):
+                       for j in range(max(0, k - 6), k)):
                     out.append(i)
                 break
             if op.startswith(('str', 'vstr', 'stm', 'push')) and not re.search(r'\[sp(, #\d+)?\]$', args):
@@ -1142,6 +1142,20 @@ def main():
     for i in toc_tails:
         if not to_swu(i):
             errors.append(f'stage 4: the tail compare at 0x{body[i][0]:08x} is not followed by a guarded software update')
+    # the tail's software resets (31 Oct): the ON span ended at once (RST1R = SRT, #1) when the solved end is not far
+    # enough ahead, and after the update (RST1R = CMP1 | SRT, #9) when the counter is near or past the compare
+    def srt_stores(val):
+        n_ = 0
+        for k, (a, op, args) in enumerate(body):
+            r = re.match(REGN + r', \[' + REGN + r', #192\]$', args)
+            if op.startswith('str') and r and any(body[j][1].startswith('mov') and
+                                                 body[j][2].replace(' ', '') == f'{r.group(1)},#{val}'
+                                                 for j in range(max(0, k - 6), k)):
+                n_ += 1
+        return n_
+    if srt_stores(1) < 1 or srt_stores(9) < 1:
+        errors.append(f'stage 4: the OFF-ON tail\'s software resets missing (RST1R = SRT: {srt_stores(1)}, '
+                      f'= CMP1 | SRT: {srt_stores(9)}; 1 each expected)')
     for q in sqrts:
         before = [k for k in forced if q - 40 <= k < q]
         after_swu = [k for k in swu if q < k <= q + 60]

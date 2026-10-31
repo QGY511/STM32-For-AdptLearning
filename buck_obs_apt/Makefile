@@ -18,10 +18,9 @@ CFLAGS  := $(CPU) -std=gnu11 -O3 -g3 -ffunction-sections -fdata-sections -fno-co
 LDSCRIPT ?= STM32G474RETX_FLASH.ld
 LDFLAGS := $(CPU) -T$(LDSCRIPT) --specs=nano.specs --specs=nosys.specs \
            -Wl,--gc-sections,-Map=$(BUILD)/$(NAME).map -Wl,--print-memory-usage
-# The TOC planner and learning math (hardware independent, also built for the host
-# tests) and the TOC firmware (Src/buck_toc.c) are linked since stage 2 (29 Oct 2026;
-# user Q12: the image is no longer Buck_disturb_obs's).
-TOC_SRC := Src/buck_toc_plan.c Src/buck_learn.c
+# The TOC math is header-only since stage 4 (Inc/buck_toc.h, also built for the host
+# tests); the TOC firmware (Src/buck_toc.c) is linked since stage 2 (29 Oct 2026).
+TOC_SRC :=
 SOURCES := $(wildcard Src/*.c)
 OBJECTS := $(patsubst Src/%.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/startup.o
 HOSTCC  ?= cc
@@ -49,9 +48,9 @@ $(BUILD)/%.list: $(BUILD)/%.elf
 test: | $(BUILD)
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=undefined -IInc Tests/test_ctrl.c -lm -o $(BUILD)/test_ctrl
 	$(BUILD)/test_ctrl
-# Host tests of the TOC planner and the learning math (Inc/buck_toc_plan.h,
-# Inc/buck_learn.h) against the double-precision originals (Tests/reference_toc.h)
-# and the specification's formulas.
+# Host tests of the feed-forward TOC (stage 4): the L-C solve and the Jacobian step
+# (Inc/buck_toc.h) against double-precision L-C integrations, and the frame's sequence
+# on the switched plant (Tests/test_toc.c).
 toc-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=undefined -IInc Tests/test_toc.c $(TOC_SRC) -lm -o $(BUILD)/test_toc
 	$(BUILD)/test_toc

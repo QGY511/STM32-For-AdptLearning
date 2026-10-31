@@ -34,73 +34,62 @@ enum {
     BUCK_FAULT_DEADLINE = 5U,   /* running: the CMP1 write would miss the period boundary */
     BUCK_FAULT_DAC = 6U,        /* DAC enable timeout */
     BUCK_FAULT_CPU = 8U,        /* NMI / HardFault / MemManage / BusFault / UsageFault */
-    BUCK_FAULT_TOC = 9U         /* TOC frame: a hardware check failed (g_buck.toc.chk_*; Src/buck_toc.c) */
+    BUCK_FAULT_TOC = 9U         /* TOC frame: a hardware check or a frame write window failed (g_buck.toc.chk_*;
+                                   Src/buck_toc.c) */
 };
 
-/* ---- TOC and learning (buck_obs_apt stage 2, 29 Oct 2026): APPENDED to g_buck
- * (default L): every field before g_buck.toc keeps its offset. Src/buck_toc.c,
- * README "TOC and learning". All 0 at reset except the coefficients' defaults. */
-enum {
-    BUCK_TOCS_IDLE = 0U, BUCK_TOCS_PLAN = 1U, BUCK_TOCS_WAIT = 2U, BUCK_TOCS_FRAME = 3U, BUCK_TOCS_D = 4U,
-    BUCK_TOCS_LEARN = 5U        /* stage 2b: the learning periods after D */
-};
-enum {                          /* g_buck.toc.rej[] index: why a request made no frame */
-    BUCK_TOCR_NONE = 0U,        /* no verified pair */
-    BUCK_TOCR_LIMIT,            /* outside the frame limits (default H) */
-    BUCK_TOCR_ALREADY,          /* already at the target */
-    BUCK_TOCR_INVALID,          /* non-finite input or intermediate */
-    BUCK_TOCR_LATE,             /* the plan was not ready by the arming sample, a sample was read late
-                                   (counter check), or the arming came too late (stage 2b: no fault) */
-    BUCK_TOCR_EARLY,            /* edge in the first BUCK_TOC_QUIET_PASSES passes after arming */
+/* ---- Feed-forward TOC (stage 4, 30 Oct 2026; Src/buck_toc.c, Inc/buck_toc.h): appended to g_buck,
+ * every field before g_buck.toc keeps its offset. All 0 at reset except the defaults below. */
+enum { BUCK_TOCS_IDLE = 0U, BUCK_TOCS_FRAME = 1U, BUCK_TOCS_END = 2U, BUCK_TOCS_FIRST = 3U };
+enum {                          /* g_buck.toc.rej[] index: a score edge without a (solved) frame */
+    BUCK_TOCR_LATE = 0U,        /* the start came after BUCK_TOC_START_LAST or its update's guard missed (the
+                                   period's first A0 trigger): no frame */
+    BUCK_TOCR_K,                /* V_ref changed since the constants were formed (they are formed then: the next
+                                   edge can start) */
+    BUCK_TOCR_NONE,             /* the frame started (feed-forward) but the L-C pair has no solution: the
+                                   first span ended as soon as possible, the second lands the current */
     BUCK_TOCR_N
 };
 typedef struct {
-    /* tunables, written by the debugger (read at each score edge / each normal HOLD pass) */
-    uint32_t toc_enable;        /* 1: a rising score edge (g 0 -> 1) in a normal HOLD pass requests a TOC */
-    uint32_t learn_enable;      /* 1: DeltaI every normal HOLD pass; kappa, q and G after each TOC */
-    /* learned coefficients: used by the next request (persist over STOP/RUN; writable) */
-    float delta_i;              /* DeltaI, A */
-    float q[2];                 /* q[ON_OFF] = q_valley, q[OFF_ON] = q_peak, A */
-    float g[2][2];              /* timing gains g[order] = {g_on, g_off} */
-    float kappa;                /* raw-load jump coefficient, A/A */
-    /* DeltaI anchor (SPEC normal_anchor): V, m, Ic = m + DeltaI of the last normal HOLD pass */
-    float an_v, an_m, an_ic;
-    uint32_t an_loops;          /* loops of that pass; valid only if the next pass has loops + 1 */
-    uint32_t an_valid;
-    /* episode state and counts */
+    /* tunables, written by the debugger */
+    uint32_t toc_enable;        /* 1: a rising score edge (g 0 -> 1) in a HOLD pass starts a TOC (taken up at the
+                                   next telemetry pass, every 64 passes) */
+    uint32_t learn_enable;      /* 1: the Jacobian step on g and the equilibrium correction b after each frame */
+    float g[2][2];              /* timing gains, g[order] = {g_on, g_off} (order 0 ON-OFF, 1 OFF-ON); writable,
+                                   a value outside [BUCK_TOC_G_MIN, BUCK_TOC_G_MAX] is used as 1 */
+    float b[2];                 /* equilibrium correction by order, A (stage 4b): I_eq = the edge's estimate + b;
+                                   writable, outside [-BUCK_TOC_B_MAX_A, BUCK_TOC_B_MAX_A] used as 0 */
+    /* counts */
     uint32_t state;             /* BUCK_TOCS_*: where the last episode is / ended */
-    uint32_t edges;             /* score edges seen by the TOC handler (rising g in normal HOLD passes) */
-    uint32_t requests;          /* accepted requests (planning started) */
-    uint32_t frames;            /* frames executed to D */
-    uint32_t rej[BUCK_TOCR_N];  /* requests without a frame, by reason */
-    /* the last plan / frame */
-    int32_t plan_status;        /* BUCK_TOC_READY 1, ALREADY 2, NONE -1, LIMIT -2, INVALID -3, ABORT -4 */
+    uint32_t edges;             /* score edges that reached the TOC code */
+    uint32_t frames;            /* frames run to their end */
+    uint32_t rej[BUCK_TOCR_N];
+    uint32_t learn_n;           /* Jacobian steps taken */
+    uint32_t learn_skip;        /* frames whose residuals were beyond the SKIP bounds (or learning off) */
+    uint32_t b_n;               /* equilibrium corrections taken */
+    uint32_t learn_low;         /* frames not learned from: the first period's mean current below LEARN_IMIN */
+    uint32_t learn_late;        /* Jacobian steps dropped: not done within BUCK_TOC_LEARN_PASSES passes */
+    /* the last frame */
     uint32_t order;             /* 0 ON-OFF, 1 OFF-ON */
-    uint32_t on_ticks, off_ticks, per_ticks, resume_cmp, end_cmp;
-    float x0_i, x0_v, ieq, target_i;
-    uint32_t plan_samples;      /* samples read while planning (the frame starts after BUCK_TOC_PLAN_PERIODS) */
-    float i_d, v_d, i_meas_d, i_pred_d, m_e, v_s0;   /* at D: corrected i(D), V(D), measured/model ADC2 mean, m_E; V(S0) */
-    uint32_t arm_cnt, f_cnt, d_cnt;                  /* Timer A counter at the guarded writes: arming, return, D */
+    uint32_t sat;               /* BUCK_TOC_SAT_* */
+    uint32_t c_start;           /* Timer A counter at the first software update (the start), ticks */
+    uint32_t c_swu2;            /* ... at the second (the solved frame), ticks */
+    uint32_t t1_ticks, t2_ticks;   /* the spans as applied (first, second; physical), ticks */
+    uint32_t per_ticks;         /* PER' of the frame */
+    uint32_t hold_cmp;          /* CMP1 of the held duty (P1 and P2) */
+    float v0, i0, ieq, a;       /* solve: v_out, measured average, I_eq, i0 - I_eq */
+    float t1_model, t2_model;   /* the solve's spans before gains and clamps, ticks */
+    float v_mid;                /* the period's own A0 pair, converted inside the frame (dropped), V */
+    float v_end, z_v;           /* the sample at the frame's end and z_v = v_end - V_ref (V) */
+    float v_1;                  /* the sample after the first period, V */
+    float i_first;              /* the first period's measured mean current i_P1: the voltage PI's new integrator (A) */
+    float z_i;                  /* the landing i_P1 - I_eq (A): the timing's current residual */
+    float i_load;               /* the load over the first period, i_P1 - (C/T)(v_1 - v_end) (A) */
+    float e_b;                  /* the equilibrium residual I_load - I_eq (A): b's */
     /* hardware checks (RM0440 items not confirmed by the manual; README bench tests) */
-    uint32_t chk_commit;        /* frame or return transfer not seen (MUPD/UPD) */
-    uint32_t chk_out;           /* CHA1 state/flags not as encoded in the first span (SET1R at the boundary) */
+    uint32_t chk_commit;        /* the frame's end transfer not seen (MUPD / UPD) */
     uint32_t chk_align;         /* master and Timer A counters drifted apart */
-    int32_t align_ref, align_last;   /* Timer A minus master counter, read back to back: before / after the frame */
-    /* learning */
-    uint32_t kappa_n, q_n, g_n, q_rej, g_rej, di_n;  /* updates published / rejected; DeltaI steps */
-    uint32_t slice_max;         /* stage 2 learning slices: unused since stage 2b (always 0) */
-    /* stage 2b (30 Oct 2026): planning and learning periods, late checks (appended) */
-    uint32_t plan_ready;        /* samples read since R when the last frame was ready to arm (spare periods:
-                                   BUCK_TOC_PLAN_PERIODS - plan_ready; 0: not ready) */
-    uint32_t late_svc;          /* samples read late in their period (planning/learning; counter check) */
-    uint32_t late_arm;          /* armings refused late (counter before the guarded writes, or a missed guard) */
-    uint32_t learn_samples;     /* samples read in the last learning periods (<= BUCK_TOC_LEARN_PERIODS) */
-    uint32_t learn_done;        /* jobs done in the last learning periods: 1 kappa, 2 G, 4 q (published or
-                                   rejected by their gates) */
-    uint32_t learn_late;        /* learning jobs dropped: not done by the end of the learning periods */
-    uint32_t kappa_rej;         /* kappa updates rejected (non-finite) */
-    uint32_t d_hold;            /* D passes that ended late: B read by the TOC code, the duty held one more period */
-    float v_b, m_b;             /* B (the first sample after D): v_out and the observer's m after its step */
+    int32_t align_ref, align_last;
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.
@@ -175,7 +164,7 @@ typedef struct {
                                   before; in a BUCK_ADC_CSR_POLL = 0 build one branch has a register
                                   move between the literal load and the read); 0 until a fault 5 (it
                                   latches until reset, so the value stays) */
-    buck_toc_t toc;            /* TOC and learning (stage 2, appended: see buck_toc_t) */
+    buck_toc_t toc;            /* feed-forward TOC (stage 4, appended: see buck_toc_t) */
 } buck_t;
 
 extern buck_t g_buck;

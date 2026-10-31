@@ -5,8 +5,8 @@
 #include "stm32g4xx.h"
 #include <stddef.h>
 #include "buck.h"
-#include "buck_learn.h"
 #include "buck_toc_fw.h"
+#include "buck_toc_start.h"
 
 #define TIMER_A       (HRTIM1->sTimerxRegs[0])
 #define HRTIM_MASTER  (HRTIM1->sMasterRegs)
@@ -58,7 +58,7 @@ buck_t g_buck = {
     .tune = BUCK_TUNE_DEFAULTS,
     .warmup = BUCK_WARMUP_CYCLES,
     .toc = { .toc_enable = BUCK_TOC_ENABLE_DEFAULT, .learn_enable = BUCK_LEARN_ENABLE_DEFAULT,
-             .g = { { 1.0f, 1.0f }, { 1.0f, 1.0f } }, .kappa = BUCK_KAPPA_INIT },
+             .g = { { 1.0f, 1.0f }, { 1.0f, 1.0f } } },
 };
 
 /* HRTIM update configuration (stage 2, user decision 6 and RM0440 item 2, stage1/rm0440.txt):
@@ -66,7 +66,8 @@ buck_t g_buck = {
  * master) are preloaded and transfer at every master roll-over (MREPU, MREP = 0), and
  * Timer A transfers its preloads at the master update (MSTU) instead of its own roll-over,
  * so the TOC frame's period, compares and output sources change in both timers in one
- * update event, and the two counters stay locked. With equal periods (always: normal
+ * update event (stage 4: the frame's end; its start is a software update of both, CR2
+ * MSWU | TASWU, Src/buck_toc.c), and the two counters stay locked. With equal periods (always: normal
  * periods 8960, a frame PER' = MPER') both are the same roll-over as in
  * Buck_disturb_obs, where Timer A updated on its own roll-over (TREPU) and the master
  * had no preload; the CMP1 duty preload is therefore taken at the same instant
@@ -177,11 +178,12 @@ static void hrtim_init(void)
     TIMER_A.PERxR = BUCK_HRTIM_PERIOD;
     TIMER_A.REPxR = 0U;
     TIMER_A.CMP1xR = BUCK_CMP_MIN;
-    TIMER_A.CMP2xR = BUCK_TOC_CMP2_IDLE;        /* used only as the OFF-ON frame's set (SET1R') */
+    TIMER_A.CMP2xR = BUCK_TOC_CMP2_BACKSTOP;    /* a no-op reset (below); a TOC frame's first span end */
     TIMER_A.CMP3xR = BUCK_VSAMPLE_CMP;          /* 2nd v_out sample */
     TIMER_A.CMP4xR = BUCK_VSAMPLE0_CMP;         /* 1st v_out sample */
     TIMER_A.SETx1R = HRTIM_SET1R_PER;           /* reference high at the period start */
-    TIMER_A.RSTx1R = HRTIM_RST1R_CMP1;          /* low at CMP1 */
+    TIMER_A.RSTx1R = HRTIM_RST1R_CMP1 | HRTIM_RST1R_CMP2;   /* low at CMP1; CMP2 the TOC's backstop
+                                                                (stage 4: the high side is off by then) */
     TIMER_A.SETx2R = 0U;                        /* CHA2 comes from the dead-time unit */
     TIMER_A.RSTx2R = 0U;
     TIMER_A.DTxR = BUCK_DT_COUNTS | (BUCK_DT_COUNTS << HRTIM_DTR_DTF_Pos) |
@@ -652,6 +654,38 @@ static inline __attribute__((always_inline)) uint32_t run_pass(buck_t *b, run_ct
         run_exit(b, bad);
         return PASS_EXIT;
     }
+    /* The feed-forward TOC (stage 4): a rising score edge (trig = the last pass's g ^ 1 while the TOC
+     * is enabled, and this sample's S >= S_th) in a HOLD pass (not the first pass after arming nor the
+     * pass after a tunables pass, both constant here) starts the frame at once, inline, before the PIs
+     * (Inc/buck_toc_start.h): the score needs v_out alone, and the frame replaces the period this pass's
+     * CMP1 would be for (the PIs restart after the frame from the measured state). Then, still in this
+     * pass, its observer step, A2 and D4 (g = 1), as an ordinary pass makes them (31 Oct, user: the step
+     * of the edge's sample in the edge pass itself), after the frame's words (the return words are in:
+     * nothing of the frame waits for it) and on every path of the start (a reject too). PASS_TOC: loops
+     * is counted on by the TOC code. With the TOC disabled (trig = 0) the pass pays the load of trig and
+     * its branch. */
+    if (ramp_mode == BUCK_RAMP_HOLD && first == NULL && epoch == 0U) {
+        if (g_toc_mb.trig != 0U) {
+            const float v = (float)adc_v * kq.vsum;                         /* buck_adc_to_v */
+            if (UNLIKELY(buck_trigger_score_ko(v - c->s.vref, c->sk, 0) >= c->t.s_th)) {
+                buck_toc_start_inline(b, hrtim, v, buck_adc_to_i_o(&c->t, adc_i4, 0), c->s.vref);
+                /* v_out and the measured average back from the mailbox (the start stored them: held in
+                 * registers across it they cost spills inside the first span's solve), opaque: not the
+                 * ordinary pass's expressions (GCC would hoist the step in front of the branch, onto the
+                 * path of the ordinary pass's CMP1 write) */
+                float vo = g_toc_mb.v, im = g_toc_mb.im;
+                __asm__("" : "+t"(vo), "+t"(im));
+                IO_WR(ahb2, DAC1_BASE - ADC1_BASE + offsetof(DAC_TypeDef, DHR12R1),
+                      buck_iload_dac_k(buck_obs_step_ao(&c->obs, vo, im, c->ok, c->q.obs_a, 0), c->q.dac_k));
+                uint32_t d4 = D4_PIN;
+                __asm__("" : "+r"(d4));
+                uintptr_t ahb2_gpio = AHB2PERIPH_BASE;
+                __asm__ volatile("" : "+r"(ahb2_gpio));
+                ((GPIO_TypeDef *)(ahb2_gpio + (GPIOB_BASE - AHB2PERIPH_BASE)))->BSRR = d4;
+                return PASS_TOC;
+            }
+        }
+    }
     /* voltage PI -> i_ref, current PI on i_ref - i_meas -> duty (stage 3: the measured average) */
     buck_step_t st;
     buck_fast_pend_t pd;                    /* for the state updates after the write (buck_ctrl_fast_commit) */
@@ -733,6 +767,10 @@ missed: ;   /* the deadline branch of the asm above (bhs): late >= window */
         __asm__ volatile("" : "+r"(ahb2_gpio));
         ((GPIO_TypeDef *)(ahb2_gpio + (GPIOB_BASE - AHB2PERIPH_BASE)))->BSRR = d4;
     }
+    /* the TOC's trigger word and the next pass's v_out,prev (stage 4), in every pass: a HOLD pass
+     * after any other finds them current */
+    g_toc_mb.trig = (g ^ 1U) & g_toc_mb.en;
+    g_toc_mb.v_prev = st.v;
     if (epoch) {
         /* the pass after a tunables pass (tscout, 28 Oct): the target of the tunables that pass
          * read, and the reference step for the next BUCK_TELEMETRY_EVERY passes (buck_ramp_mode),
@@ -759,13 +797,9 @@ missed: ;   /* the deadline branch of the asm above (bhs): late >= window */
             o.i_load = c->obs.ih;
             o.g = (d4 >> 5) & 1U;                   /* = g: D4_PIN is bit 5 */
             b->out = o;
-            /* the TOC trigger word's learning bit from g_buck.toc.learn_enable (stage 2: it takes effect here,
-             * every 64 passes, as the tunables do in the tunables pass); while learning jobs are pending the
-             * next normal HOLD pass calls the TOC handler for a slice (one per 64 passes: the passes with
-             * learning on have ~30 clocks to spare, a slice takes ~200) */
-            g_toc_mb.trig = (g_toc_mb.trig & ~BUCK_TOC_LEARN_BIT)
-                            | ((g_buck.toc.learn_enable && (int32_t)(c->loops - g_toc_mb.di_hold) >= 0) ? BUCK_TOC_LEARN_BIT : 0U)
-                            | (g_toc_mb.forced ? BUCK_TOC_FORCE : 0U);   /* a learning slice after the next pass */
+            /* the TOC's enable from g_buck.toc.toc_enable (stage 4: it takes effect here, every 64 passes, as
+             * the tunables do in the tunables pass), held off for BUCK_TOC_HOLDOFF_PASSES after a frame */
+            g_toc_mb.en = (g_buck.toc.toc_enable != 0U && (int32_t)(c->loops - g_toc_mb.hold_until) >= 0) ? 1U : 0U;
             b->adc_v_raw = adc_v; b->adc_i4_raw = adc_i4; b->loops = c->loops;
             return PASS_NORMAL;
         }
@@ -783,40 +817,6 @@ missed: ;   /* the deadline branch of the asm above (bhs): late >= window */
         c->ki_t_i = buck_pi_ki_t(c->t.ki_i);
         c->sk = buck_score_k(&c->t);
         return PASS_RELOADED;               /* the target and the ramp step: the next pass (epoch) */
-    }
-    if (ramp_mode == BUCK_RAMP_HOLD) {
-        /* TOC and learning (stage 2), in the ordinary HOLD passes only (default A: not in the
-         * first pass, the telemetry, tunables and post passes, nor in a ramp): a rising score
-         * edge, or a pass the TOC code asked for (learning), goes to buck_toc_event() through
-         * run_loop with this pass's v, i_meas and D4 word in the mailbox. Otherwise, with
-         * learning on, the DeltaI step (SPEC 177-187, 204) on the mailbox-free path. All of it
-         * after this pass's CMP1 write and results. */
-        /* the trigger word in SRAM (g_toc_mb.trig; bit 0 = learning on), not in a register: the passes'
-         * register allocation stays that of Buck_disturb_obs as far as possible */
-        const uint32_t w = g_toc_mb.trig;
-        g_toc_mb.trig = (d4 >> 16) | (w & BUCK_TOC_LEARN_BIT);
-        uint32_t ret = PASS_NORMAL;
-        if (UNLIKELY((d4 & w) != 0U)) {
-            if (w & BUCK_TOC_FORCED_BIT) {
-                ret = PASS_TOC;                     /* a pass the TOC code asked for (learning): after DeltaI */
-            } else if (g_buck.toc.toc_enable != 0U) {   /* a rising score edge: maybe a request (no DeltaI, SPEC) */
-                g_toc_mb.v = st.v; g_toc_mb.im = st.im; g_toc_mb.d4 = d4;
-                return PASS_TOC;
-            }
-        }
-        if (UNLIKELY(w & BUCK_TOC_LEARN_BIT)) {     /* DeltaI (SPEC 177-187, 204) */
-            buck_toc_t *const T = &g_buck.toc;
-            const buck_learn_anchor_t a = { T->an_v, T->an_m, T->an_ic, T->an_valid & (T->an_loops + 1U == c->loops) };
-            const float m = c->obs.ih;
-            const float di = buck_learn_delta_i(&a, st.v, st.im, m, T->delta_i);
-            T->delta_i = di;
-            T->an_v = st.v; T->an_m = m; T->an_ic = m + di; T->an_loops = c->loops; T->an_valid = 1U;
-            ++T->di_n;
-        }
-        if (UNLIKELY(ret != PASS_NORMAL)) {
-            g_toc_mb.v = st.v; g_toc_mb.im = st.im; g_toc_mb.d4 = d4;
-            return ret;
-        }
     }
     return PASS_NORMAL;
 }
@@ -869,10 +869,11 @@ static RUN_CODE void run_loop(buck_t *b)
     c.kc = buck_kc_init();
     __asm__("" : "+t"(c.kc.vsum), "+t"(c.kc.d_min), "+t"(c.kc.d_max), "+t"(c.kc.per), "+t"(c.kc.inv_vin));
     c.hr = (uintptr_t)HRTIM1; OPAQUE(c.hr);
-    g_toc_mb.trig = b->toc.learn_enable ? BUCK_TOC_LEARN_BIT : 0U;   /* no request before g has been 0 */
-    g_toc_mb.loops0 = c.loops;                  /* the TOC code: quiet passes after arming, and a new run */
-    ++g_toc_mb.run;                             /*   cancels its pending learning (buck_toc_event) */
-    g_toc_mb.forced = 0U;
+    g_toc_mb.trig = 0U;                         /* no request before g has been 0 */
+    g_toc_mb.en = 0U;                           /* nor before the first telemetry pass (BUCK_RUN_QUIET_PASSES) */
+    g_toc_mb.hold_until = c.loops;
+    g_toc_mb.vref = c.target;                   /* the solve's constants for the reference the ramp ends at */
+    BUCK_TOC_CALL(buck_toc_prime);
     c.dwt = (uintptr_t)DWT; OPAQUE(c.dwt);
 #if BUCK_ADC_CSR_POLL
     c.csr_mask = CSR_BAD_MASK; OPAQUE(c.csr_mask);
@@ -1011,37 +1012,20 @@ static RUN_CODE void run_loop(buck_t *b)
             r = run_pass(b, &c, BUCK_RAMP_##M, NULL, 1U);                       \
             if (r == PASS_EXIT) return;                                         \
         } while (c.mode == BUCK_RAMP_##M)
-        /* PASS_TOC (HOLD copy only): the TOC handler (and the episode if it accepts a request),
-         * with the controller state through the mailbox; then on in the same copy. */
+        /* PASS_TOC (HOLD copy only, stage 4; the frame has started in the pass, its return words and the
+         * pass's observer step are in): the state into the mailbox and the rest (buck_toc_finish: with a
+         * frame, its samples after it); then on in the same copy with the state taken back. */
 #define RUN_TOC()                                                               \
         do {                                                                    \
-            if ((g_buck.toc.toc_enable | g_buck.toc.learn_enable) == 0U) break;  /* both off: nothing to do */ \
-            if (g_toc_mb.forced) {              /* a pass the TOC code asked for (learning) */ \
-                if (g_toc_mb.cap_b) {               /* B (SPEC): its V and m for the q job */ \
-                    g_toc_mb.cap_b = 0U; g_toc_mb.v_b = g_toc_mb.v; g_toc_mb.m_b = c.obs.ih; \
-                    g_toc_mb.loops_b = c.loops;                                 \
-                }                                                               \
-                /* only with time to spare before the next sample (BUCK_TOC_SLICE_LAST): else the next pass */ \
-                const uint32_t cnt_ = TIMER_A.CNTxR;                            \
-                const uint32_t g_ = (g_toc_mb.d4 >> 5) & 1U;                    \
-                const uint32_t edge_ = g_ & (g_toc_mb.g_last ^ 1U) & (g_buck.toc.toc_enable != 0U); \
-                if (!edge_ && (cnt_ < BUCK_CHECK_EARLIEST || cnt_ > BUCK_TOC_SLICE_LAST || \
-                               (ADC12_COMMON->CSR & ADC_CSR_EOC_MST))) {        \
-                    g_toc_mb.g_last = g_;           /* (the handler's edge test needs it) */ \
-                    break;                          /* a request (edge) always goes on */ \
-                }                                                               \
-            }                                                                   \
-            g_toc_mb.ih = c.obs.ih; g_toc_mb.loops = c.loops;                   \
-            if ((g_toc_mb.d4 & 32U) && g_buck.toc.toc_enable && !(g_toc_mb.forced && g_toc_mb.g_last)) { /* maybe a request */ \
-                g_toc_mb.s = c.s; g_toc_mb.obs = c.obs; g_toc_mb.ok = c.ok;     \
-                g_toc_mb.t.isense_zero = c.t.isense_zero;                       \
-                g_toc_mb.t.isense_gain = c.t.isense_gain;                       \
-            }                                                                   \
-            BUCK_TOC_CALL(buck_toc_event);      /* runs the episode if it accepts */ \
-            if (g_toc_mb.req) {                                                 \
-                if (g_toc_mb.ret == BUCK_TOC_RET_EXIT) return;                  \
-                c.s = g_toc_mb.s; c.obs = g_toc_mb.obs;                         \
-            }                                                                   \
+            g_toc_mb.s = c.s; g_toc_mb.obs = c.obs; g_toc_mb.ok = c.ok;         \
+            g_toc_mb.kp_v = c.t.kp_v; g_toc_mb.kp_i = c.t.kp_i;                 \
+            g_toc_mb.ki_t_v = c.ki_t_v; g_toc_mb.ki_t_i = c.ki_t_i;             \
+            g_toc_mb.isense_zero = c.t.isense_zero;                             \
+            g_toc_mb.isense_gain = c.t.isense_gain;                             \
+            g_toc_mb.s_th = c.t.s_th; g_toc_mb.sk = c.sk; g_toc_mb.loops = c.loops; \
+            BUCK_TOC_CALL(buck_toc_finish);                                     \
+            if (g_toc_mb.ret == BUCK_TOC_RET_EXIT) return;                      \
+            c.s = g_toc_mb.s; c.obs = g_toc_mb.obs; c.loops = g_toc_mb.loops;   \
         } while (0)
         if (mode == BUCK_RAMP_HOLD) {
             RUN_COPY(HOLD);

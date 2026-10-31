@@ -150,8 +150,8 @@
 #define BUCK_C_F                 270e-6
 #define BUCK_VIN_V               6.0                  /* constant, no V_in sense pin (user) */
 #define BUCK_RL_OHM              0.114                /* r_L (user; [BVM] DC fit): the PI design (tools/pi_design.py),
-                                                         the SPEC's R0 (handover/resume duty, the target ripple); the TOC's
-                                                         L-C model is lossless (stage 3; BUCK_TOC_LC_RDROP) */
+                                                         the TOC's held duty (V_ref + r_L I_eq)/V_in; the TOC's L-C
+                                                         model is lossless (stage 4) */
 
 /* ---- Sensing --------------------------------------------------------------- */
 #define BUCK_ADC_VREF_V          3.3
@@ -293,62 +293,106 @@ _Static_assert(BUCK_VSAMPLE0_CMP > BUCK_CMP_MAX + BUCK_DT_TICKS + 96U, "both v_o
 _Static_assert(BUCK_VSAMPLE_LEAD_TICKS > 5U * BUCK_ADC_CLK_TICKS, "2nd v_out hold (SMP + up to 2.5 clocks of trigger latency) before the period end");
 _Static_assert(BUCK_ISAMPLE_CMP(0) >= 96U && BUCK_ISAMPLE_CMP(3) < BUCK_HRTIM_PERIOD - 96U, "current sample compares");
 
-/* ---- TOC frame (buck_obs_apt; Inc/buck_toc_frame.h, Src/buck_toc.c) -------------
- * A planned pulse pair runs as ONE Timer A period of PER' ticks, the master period
- * locked to it (user decision 6). Plans whose frame breaks a limit are rejected
- * (no TOC), never shortened (default H). Limits (user, 29 Oct, stage1 Q2, Q3):
- *   ON span  >= DT + 96 (an HRTIM reference pulse shorter than the dead time is
- *               skipped on the high side, RM0440 Figure 227),
- *   OFF span >= 2 DT + 96 (both dead times plus the HRTIM 3-clock minimum),
- *   PER'     <= 0xFFDF - 2048 (RM0440 Table 232 limit, margin Q3) and
- *            >= 1300 + the return-write guard (Q2).
- * Sample placement (decision 4, Inc/buck_toc_frame.h) adds: the frame's first ADC1
- * trigger after the previous period's ADC1 conversion has ended (EOC about 36
- * clocks = 1152 ticks into the frame, plus margin), its first ADC2 trigger after the
- * previous ADC2 conversion (as the normal T/8 compare), ADC2 triggers at least 20
- * ADC clocks apart (a trigger during a conversion is ignored, RM0440 21.4.18, and
- * would split the 4x TROVS group for good) and the last one well before the frame
- * end. */
-#define BUCK_TOC_PER_MARGIN_TICKS 2048U                                   /* Q3 */
-#define BUCK_TOC_PER_MAX_TICKS   (0xFFDFU - BUCK_TOC_PER_MARGIN_TICKS)
-#define BUCK_TOC_ON_MIN_TICKS    (BUCK_DT_TICKS + 96U)                    /* Q2: 368 */
-#define BUCK_TOC_OFF_MIN_TICKS   (2U * BUCK_DT_TICKS + 96U)               /* Q2: 640 */
-#define BUCK_TOC_RET_GUARD_TICKS 512U                                     /* return writes: 16 clocks before PER' */
-#define BUCK_TOC_PER_MIN_TICKS   (1300U + BUCK_TOC_RET_GUARD_TICKS)       /* Q2 */
-#define BUCK_TOC_ADC1_FIRST      1920U     /* first frame ADC1 trigger (CMP4') no earlier (previous EOC ~1152) */
-#define BUCK_TOC_ADC2_FIRST      BUCK_ISAMPLE_CMP(0U)                     /* 1120, as the normal first current sample */
-#define BUCK_TOC_ADC2_GAP_TICKS  (20U * BUCK_ADC_CLK_TICKS)               /* 1920: 20 ADC clocks, as the v pair */
-#define BUCK_TOC_ADC2_END_GUARD  600U      /* last frame ADC2 trigger at least this far before PER' */
-#define BUCK_TOC_CMP2_IDLE       0xFFDFU   /* CMP2 when unused (normal periods, ON-OFF frames): beyond PER, no event */
-_Static_assert(BUCK_TOC_OFF_MIN_TICKS > BUCK_DT_TICKS && BUCK_TOC_ON_MIN_TICKS > BUCK_DT_TICKS, "TOC span minima");
-_Static_assert(BUCK_TOC_PER_MIN_TICKS < BUCK_TOC_PER_MAX_TICKS, "TOC frame range");
-_Static_assert(BUCK_TOC_ADC1_FIRST > (36U * 32U) && BUCK_TOC_ADC2_FIRST + BUCK_HRTIM_PERIOD >= BUCK_ISAMPLE_CMP(3U) + 2U * BUCK_ADC_CLK_TICKS * 8U,
-               "first frame triggers after the previous conversions");
+/* ---- Feed-forward TOC (stage 4, 30 Oct 2026; Inc/buck_toc.h, Inc/buck_toc_start.h, Src/buck_toc.c) ----
+ * The pass whose trigger score rises (g 0 -> 1) starts the TOC at once, in the period of its own
+ * sample and before its PIs: the high side is forced on (SST; load step-up, e_v < 0: ON-OFF) or off
+ * (SRT; step-down, e_v > 0: OFF-ON) right away, the L-C pair is solved while that first span runs, and
+ * a software update of the master and Timer A preloads (CR2 MSWU | TASWU) sets the span's end and
+ * stretches the period in progress into the TOC frame; a second sets the frame's end, a normal period
+ * boundary followed by the first normal period at the held duty. Times in HRTIM ticks of the counter
+ * of the period in progress (the frame shares it). */
+#define BUCK_TOC_ON_MIN_TICKS    (BUCK_DT_TICKS + 96U)          /* 368: shorter than the dead time is skipped (RM0440 Fig. 227) */
+#define BUCK_TOC_OFF_MIN_TICKS   (2U * BUCK_DT_TICKS + 96U)     /* 640: both dead times + the HRTIM minimum */
+#define BUCK_TOC_PER_MARGIN_TICKS 2048U
+#define BUCK_TOC_PER_MAX_TICKS   (0xFFDFU - BUCK_TOC_PER_MARGIN_TICKS)   /* the frame's last counter value (RM0440 Table 232) */
+#define BUCK_TOC_TON_MAX_S       1.5e-6                         /* ON span upper clamp */
+#define BUCK_TOC_TOFF_MAX_S      6.0e-6                         /* OFF span upper clamp */
+#define BUCK_TOC_TON_MAX_TICKS   ((uint32_t)(BUCK_TOC_TON_MAX_S / BUCK_TICK_S + 0.5))
+#define BUCK_TOC_TOFF_MAX_TICKS  ((uint32_t)(BUCK_TOC_TOFF_MAX_S / BUCK_TICK_S + 0.5))
+#define BUCK_TOC_IPK_MAX_A       10.0f      /* ON-OFF: the first span ends no later than i0 + (V_in - V_ref)/L t = this */
+#define BUCK_TOC_IVAL_MIN_A      (-2.0f)    /* OFF-ON: the first span ends no later than i0 - V_ref/L t = this */
+/* The start (its counter read, before the SST) comes no later than START_LAST, so that the first
+ * software update (~100 clocks later: the SST, the solve's first span, the words, the guard) lands
+ * before the normal periods' backstop CMP2 (below); a score edge after it is not taken
+ * (g_buck.toc.rej[LATE]). README "Clock budget". */
+#define BUCK_TOC_START_LAST      (BUCK_TOC_CMP2_BACKSTOP - 64U - 32U * 112U)
+/* The second update (the frame's end, the A0 pair moved to it) comes after the period's own A0 pair has
+ * been triggered (its second trigger, Timer A CMP3, plus the trigger's resynchronisation and margin):
+ * moving the pair's second trigger before it fires would split the TROVS group. */
+#define BUCK_TOC_SWU2_FIRST      (BUCK_VSAMPLE_CMP + 256U)
+/* A compare written by a software update lies at least this far beyond the counter read before the
+ * update (the read, the arithmetic, one HRTIM store and the guard's own read: ~20 clocks static, ~26
+ * with the HRTIM accesses' wait states, README "Clock budget"; a miss is a LATE reject). */
+#define BUCK_TOC_SWU_GUARD_TICKS 1024U
+/* The frame's end: after the period's fourth current trigger (master CMP4, unchanged: the ADC2
+ * group of the frame stays four samples) and after the moved A0 pair (2458 ticks before PER'). */
+#define BUCK_TOC_PER_MIN_TICKS   (BUCK_ISAMPLE_CMP(3U) + 600U)
+#define BUCK_TOC_A0_LEAD_TICKS   (BUCK_VSAMPLE_LEAD_TICKS + BUCK_VSAMPLE_GAP_TICKS)   /* 2458: CMP4' = PER' - this */
+/* The provisional frame of the first update ends this far after the start: the second update (after
+ * BUCK_TOC_SWU2_FIRST and its path, at the latest ~231 clocks after the SST static, ~290 with wait states;
+ * README "Clock budget") must come before it (its guard: a miss is fault 9). 31 Oct: 320 -> 336 clocks, the
+ * held duty before the wait and the pessimistic path from it. */
+#define BUCK_TOC_PER0_REL_TICKS  (32U * 336U)
+/* Timer A CMP2 in normal periods, a reset source of the high side (RST1R = CMP1 | CMP2): a no-op there
+ * (the high side is off from CMP1 <= BUCK_CMP_MAX + DT on), and the end of a forced on-time if the
+ * first update does not come (only a stalled CPU: every guard miss ends the span at once; do not halt
+ * with the stage energized). Late in the period so that it never binds a running start. */
+#define BUCK_TOC_CMP2_BACKSTOP   (BUCK_HRTIM_PERIOD - 640U)
+#define BUCK_TOC_RET_GUARD_TICKS 512U       /* the return words' last store at least 16 clocks before PER' */
+/* After the counter read that follows the second update's wait (31 Oct), README "Clock budget":
+ *   SWU2_PATH: to the second update: 29-34 clocks static (46 with the OFF-ON tail), up to 9 HRTIM
+ *              accesses: 73 with 3 wait clocks each; the moved A0 pair's first trigger lies at least
+ *              this far after the read;
+ *   RET_PATH:  to buck_toc_ret()'s guard read: 77-82 clocks static (94 with the tail), up to 18 HRTIM
+ *              accesses: 148 with 3 wait clocks each.
+ * The frame's end PER' at least END_LEAD after the read (a miss of the return words' guard is fault 9). Until 31 Oct the bound was the A0 lead + one guard (3482 ticks, ~93 clocks)
+ * against ~158 clocks static to the return words' guard: a frame ending there tripped fault 9. */
+#define BUCK_TOC_SWU2_PATH_TICKS (32U * 80U)
+/* The OFF-ON tail's earliest end (Inc/buck_toc_start.h), after the same read: the static path (46 clocks)
+ * and 18 clocks of wait states, not the pessimistic budget above. A later update only lets the compare
+ * pass unseen: the high side then stays on to the frame's end (the frame as before the tail), no fault. */
+#define BUCK_TOC_TAIL_LEAD_TICKS (32U * 64U)
+#define BUCK_TOC_RET_PATH_TICKS  (32U * 160U)
+#define BUCK_TOC_END_LEAD_TICKS  (BUCK_TOC_RET_PATH_TICKS + BUCK_TOC_RET_GUARD_TICKS)
+_Static_assert(BUCK_TOC_END_LEAD_TICKS >= BUCK_TOC_A0_LEAD_TICKS + BUCK_TOC_SWU2_PATH_TICKS,
+               "the moved A0 pair's first trigger (PER' - A0 lead) comes after the second update");
+#define BUCK_TOC_HOLDOFF_PASSES  128U       /* no new request for this many passes after a frame (213 us) */
+_Static_assert(BUCK_TOC_PER_MIN_TICKS < BUCK_HRTIM_PERIOD + BUCK_TOC_A0_LEAD_TICKS, "TOC frame minimum");
+_Static_assert(BUCK_TOC_START_LAST + 32U * 64U + BUCK_TOC_TON_MAX_TICKS + BUCK_TOC_TOFF_MAX_TICKS < BUCK_TOC_PER_MAX_TICKS &&
+               BUCK_TOC_START_LAST + BUCK_TOC_PER0_REL_TICKS < BUCK_TOC_PER_MAX_TICKS, "TOC frame range");
+_Static_assert(BUCK_ISAMPLE_CMP(0U) + BUCK_TOC_PER0_REL_TICKS > BUCK_TOC_SWU2_FIRST + BUCK_TOC_SWU2_PATH_TICKS + BUCK_TOC_RET_GUARD_TICKS &&
+               BUCK_TOC_PER0_REL_TICKS > 32U * 290U + BUCK_TOC_RET_GUARD_TICKS,
+               "the provisional frame outlasts the second update (earliest start: its wait and path; latest: its path)");
+_Static_assert(BUCK_TOC_CMP2_BACKSTOP > BUCK_CMP_MAX + BUCK_DT_TICKS + 96U && BUCK_TOC_CMP2_BACKSTOP < BUCK_HRTIM_PERIOD,
+               "the CMP2 backstop is a no-op in a normal period");
 
-/* ---- Learning settings (control_pseudocode.txt, EXISTING SETTINGS) ----------
- * Iscale = 1 A in every scalar step. */
-#define BUCK_LEARN_ETA_LOAD      0.25     /* DeltaI */
-#define BUCK_LEARN_LAMBDA_LOAD   0.001
-#define BUCK_LEARN_SIGMA_LOAD_V  0.02
-#define BUCK_LEARN_CAP_LOAD_A    1.0
-#define BUCK_LEARN_RAW_LIMIT_A   1.0      /* maximum raw-load change per teaching interval */
-#define BUCK_LEARN_ETA_Q         0.10     /* q */
-#define BUCK_LEARN_LAMBDA_Q      0.10
-#define BUCK_LEARN_SCALE_Q_A     0.20     /* sigmaV = (h/C) * this */
-#define BUCK_LEARN_CAP_Q_A       0.05
-#define BUCK_LEARN_JQ_MIN        0.05     /* A/A: |Jq| >= (h/C) * this */
-#ifndef BUCK_LEARN_END_I_A                 /* (both overridable for a test build only: stage2b report) */
-#define BUCK_LEARN_END_I_A       0.75     /* endpoint quality |i_D - target| */
-#endif
-#ifndef BUCK_LEARN_END_V_V
-#define BUCK_LEARN_END_V_V       0.025    /* endpoint quality |V_D - Vref| */
-#endif
-#define BUCK_LEARN_ETA_G         0.10     /* timing gains g */
-#define BUCK_LEARN_LAMBDA_G      0.01
-#define BUCK_LEARN_SIGMA_G_I_A   0.20
-#define BUCK_LEARN_SIGMA_G_V_V   0.02
-#define BUCK_LEARN_G_REL_MAX     0.02     /* maximum relative change per update (common alpha) */
-#define BUCK_LEARN_ETA_KAPPA     0.05     /* kappa (raw-load jump coefficient) */
-#define BUCK_LEARN_EPS_KAPPA_A2  0.04
+/* ---- TOC learning: the Jacobian step on the measured end state (stage 4) ------------------------
+ * After a frame the first normal period runs at the held duty (the duty that holds I_eq). Two
+ * residuals: z_v = v_out at the frame's end - V_ref, and z_i = the first period's measured mean
+ * current - I_eq, the landing (stage 4b: the voltage change over the period, (C/T)(v_1 - v_end), is the
+ * landing plus the equilibrium error I_eq - I_load; the latter is the equilibrium correction's, below).
+ * The gains g = {g_on, g_off} of the order take the Newton step
+ *   [dt1; dt2] = -mu J^-1 [z_i; z_v],   g += g dt / t_applied
+ * on the L-C Jacobian at the applied spans, |dg| <= STEP, g in [G_MIN, G_MAX]. A first span that was
+ * clamped (the backstop limit, or the solve finished after its end) cannot move: the second span
+ * alone takes the current residual. Residuals beyond CLIP are clipped, beyond SKIP the frame
+ * teaches nothing. */
+#define BUCK_TOC_MU              0.25f
+#define BUCK_TOC_G_MIN           0.4f
+#define BUCK_TOC_G_MAX           2.5f       /* wide: the L-C model has no series loss (the fall is steeper on the board) */
+#define BUCK_TOC_G_STEP          0.25f
+#define BUCK_TOC_DET_MIN_A       0.5f       /* det J floored at m2 * this / C */
+#define BUCK_TOC_ZI_CLIP_A       2.0f
+#define BUCK_TOC_ZV_CLIP_V       0.04f
+#define BUCK_TOC_ZI_SKIP_A       6.0f
+#define BUCK_TOC_ZV_SKIP_V       0.2f
+/* The equilibrium correction b (stage 4b, user; Inc/buck_toc.h buck_toc_learn_b): I_eq = the edge's
+ * per-cycle estimate + b[order], b += mu_b (I_load - I_eq) after each frame, the same CLIP/SKIP bounds as
+ * the current residual. Neither learner runs when the first period's measured mean current is below
+ * LEARN_IMIN: A1 reads a negative current as 0, so the four-sample mean reads high when the valley goes
+ * below zero (the A1 bias is +0.02 A at 1 A, Part 2's closed loop). */
+#define BUCK_TOC_B_MU            0.5f
+#define BUCK_TOC_B_MAX_A         3.0f
+#define BUCK_TOC_LEARN_IMIN_A    0.5f
 
 #endif

@@ -1,271 +1,287 @@
-NUCLEO-G474RE buck converter: Buck_disturb_obs loop + time-optimal control (TOC) + learning
-=============================================================================================
+NUCLEO-G474RE buck converter: PI + load observer + score at 600 kHz, feed-forward time-optimal control
+=========================================================================================================
 
-**buck_obs_apt** (stage 2, 29 Oct 2026; stage 2b, 30 Oct 2026) is Buck_disturb_obs's 600 kHz control
-loop (bin 5b99a0d5, the verified per-cycle controller: PI, Padé estimator, score, load observer) with the
-TOC pulse pair and the four learning paths of `control_pseudocode.txt` added. **TOC and learning are off
-by default** (`g_buck.toc.toc_enable = learn_enable = 0`): the firmware then gives Buck_disturb_obs's
-results bit for bit (differential emulator, all suites; see *Verification*). Nothing has run on the board;
-nothing was flashed. Part 2 of this file is Buck_disturb_obs's own documentation of the base controller,
-which is unchanged.
+**buck_obs_apt, stage 4 (30 Oct 2026; 4b: the equilibrium correction b; 31 Oct: the edge pass's observer step,
+the frame-end timing fix, the OFF-ON tail).** Every switching cycle (600 kHz, no decimation): the cascaded PI
+(voltage PI -> average-current reference, current PI on the measured cycle average -> duty), the load-current
+observer (A2) and the trigger score S = a e_v^2 + b e_v + c (D4). No Padé estimator (removed in stage 3). On a
+rising score edge a **feed-forward TOC**: the high side is forced on (load step-up) or off (step-down) at once,
+in the period of the sample that saw the edge, and the time-optimal ON-OFF / OFF-ON pair is solved on the
+lossless L-C model while that first span runs. **The TOC is off by default** (`g_buck.toc.toc_enable = 0`): the
+firmware then runs the base loop of Part 2. **Nothing has run on the board; nothing was flashed.** The HRTIM
+mechanism (software set/reset of the output and software updates of the preloads in the middle of a period)
+is not confirmed by RM0440 for every detail: see *Bench tests* before enabling it with the stage powered.
 
-What was here before (the event-driven TOC firmware of 28-29 Oct) was removed in stage 1 (it is in the
-backup `scratchpad/obs_apt_toc/backup_2026-10-29_event_toc`).
-
-Status in one paragraph
------------------------
-- `make` (0 warnings), `make check` (rule 5 for the TOC code, extended in stage 2b), `make test`
-  (byte-identical to Buck_disturb_obs's output) and `make toc-test` (host tests of the planners, the
-  frame encoder and the learning math) pass.
-- Emulator, TOC/learning off: ALL SAME against Buck_disturb_obs on every suite (HF, HFX, HFN, vbit, nh)
-  at the candidate scales 1.0, 1.3, 0.6 and HFX vt at base 0.9 (the control loop, `run_loop`, is the
-  stage-2 code unchanged).
-- Emulator, TOC on: 40 TOC scenarios all pass at 1.0 x the clocks (both orders, steps, STOP in every
-  phase, overruns, a dead ADC, forced counter values, NaN coefficients and tunables, the learning
-  paths). With every instruction made slower (scale 1.05, 1.07, 1.10, 1.20) there is **no fault that
-  was not injected**: what does not fit becomes a LATE reject (stage 2b, decision 3).
-- **What the user must know** (details in *Clock budget* and `stage2b/questions.txt`):
-  1. **Planning takes 9 periods, not 5-6.** The cheaper planner (one order, one root) is only ~770 of
-     the ~2200 clocks from the request's sample to "ready to arm"; with the request pass, x0, the frame
-     model, the frame words and the sample services the work is ~7.9 periods, plus the spare period:
-     `BUCK_TOC_PLAN_PERIODS = 9` (S0 = R + 10 periods, 16.7 µs; stage 2: 10 / R + 11).
-  2. **Learning now publishes** (kappa, both G banks, q_valley in the emulator scenarios) in dedicated
-     **learning periods after D** with the duty held: kappa and G ~5 periods, q ~8 more
-     (`BUCK_TOC_LEARN_PERIODS = 16`; the block ends as soon as the jobs are done). q_peak's OFF-ON
-     frames miss their target by 1.5-1.9 A in the emulator plant, so the SPEC gate (.75 A) rejects
-     every one: q_peak is shown publishing only in a test build with the gates widened.
-
-Decisions (with dates) this implements
---------------------------------------
-- 29 Oct (DESIGN_DRAFT, accepted): base = Buck_disturb_obs's loop (1); TOC and learning per the SPEC
-  (2); lean planner after the score's rising edge (3); bulb sampling kept, v_out trigger aligned to D,
-  current = average over the last span (4); one observer step at D over the frame with a = h/C (5);
-  master locked to Timer A, both periods change for the frame (6). Defaults A-L accepted.
-- 29 Oct (stage-1 questions): Q1 dedicated planning periods + cheaper math; Q2 per-span HRTIM minima;
-  Q3 margin 2048; Q4 resume CMP1 from Ieq_plan at R; Q5 deadbeat correction k = 2a/(1+a); Q6 observer
-  current (q1 + q2 + h_last (I_last - pred))/h; Q7 current-only Padé reseed for OFF-ON; Q8 x0 from the
-  estimator's own prediction; Q9 shortest pair, no fallback; Q10 ripple from x0.v; Q11 residual
-  verification; Q12 modules linked; Q13 per-frame SET1R/RST1R; Q14 CCM placement.
-- 30 Oct (stage-2 questions): **S2-Q5** the cheaper planner: only the pulse order the sign of the error
-  calls for, one root, the residual check; fewer planning periods, duty held and PIs frozen as before.
-  **S2-Q6** learning periods after D (duty held, like planning) for kappa and G, q in dedicated periods
-  after B; every sample read, the deadline guard respected. **S2-Q14** reject, don't fault: tighter time
-  checks so an overrun becomes a LATE reject, plus one spare period. **S2-Q3** q_peak taught at B
-  (`BUCK_LEARN_QPEAK_AT_B = 1`).
-
-How the TOC works (Src/buck_toc.c, Inc/buck_toc_frame.h, Inc/buck_toc_plan.h, Inc/buck_learn.h)
------------------------------------------------------------------------------------------------
-1. **Request R.** A normal HOLD pass (not the first 24 passes after arming, not a ramp, not a
-   telemetry, tunables or post pass) whose D4 word shows a rising score edge (g 0 → 1) returns
-   `PASS_TOC`. run_loop calls `buck_toc_event()` through `BUCK_TOC_CALL` (an inline-asm call that saves
-   r0-r3, r12, lr, s0-s15 itself, so the loop's register allocation is untouched) with copies of the
-   controller state in the mailbox `g_toc_mb`. With `toc_enable = 0` no handler is called at all.
-2. **Planning periods** (Q1; 9 since stage 2b). The CMP1 preload is not written (the duty of R's pass
-   repeats); the PIs and the estimator are frozen; the observer and A2 are held (S2-Q4) and caught up at
-   F with one step of a = n T / C. Every sample is read by the sample service (`toc_svc`, inline, ~47
-   clocks) between parts of at most ~150 clocks. Request: m_R = observer i^, z = m_R - m of the
-   previous normal pass, Ieq_plan = m_R + DeltaI + kappa z; x0 = Buck_disturb_obs's `iv_pred` and
-   v + T/C (avg_pred - Ieq_plan), carried over the planning periods with the held duty (one affine
-   map per period); resume CMP1 = duty (Vref + R Ieq_plan)/Vin.
-3. **The cheaper planner** (stage 2b, decision S2-Q5; `buck_toc_fast_1..6`, Src/buck_toc_plan.c):
-   the same request part, targets, ALREADY test, gains and frame as the full planner, but **one order**:
-   `BUCK_TOC_ORDER_RULE = 1`: Vref - x0.v > 0 → ON-OFF, else OFF-ON (rule 2, the ideal-LC switching
-   curve, is built in); **one root**: the larger u of the order's quadratic (both from one reciprocal),
-   its w (one division) and the eliminated row's residual check (Q11). Host check against the full
-   planner (the SPEC's shortest feasible pair, `make toc-test` section 8): same order in 98.6 % of
-   random requests and 99.9 % of load steps, then the identical plan; otherwise the cheaper planner has
-   no pair (NONE, 0.8 % / <0.01 %) or a longer one (mean 3x; for load steps always outside the frame
-   limits). `BUCK_TOC_PLANNER_FAST = 0` restores the full planner (then about 10 planning periods).
-   After the plan: the frame's model (two spans, the reciprocals, the ADC2 model value from the
-   encoder's integer split, the deadbeat gain), then the frame words into the preloads under
-   MUDIS|TAUDIS (nothing transfers: the active registers are a normal period's). Not ready when the 9th
-   sample is read → LATE reject.
-4. **Arming** (right after the 9th sample): the frame CMP1 and the release of the bracket, each through
-   the counter guard (`TOC_GUARD`, the same instructions as `DEADLINE_ASM`). Not if the next sample is
-   already there or the counter is past `BUCK_TOC_ARM_LAST` (240 clocks): LATE reject. A missed arming
-   guard is a LATE reject too (`toc_arm_late`: the frame CMP1 put back, the bracket released).
-5. **Frame start**: wait for MUPD, then at once the return words (a normal period, CMP1 = resume) in a
-   bracket, the CMP1 and the release guarded against PER' - 512 (a miss trips fault 5: the frame is
-   committed). Then the last normal sample (F): the commit check (MUPD and UPD) and the first-span output
-   check (O1CPY, SET1/RST1 flags, read before the counter; fault 9 on a mismatch), the observer's
-   catch-up step, V(S0) and G's start.
-6. **D**: the frame's own sample (v_out pair before D, i_L in the last span): i(D) corrected with the
-   deadbeat gain (Q5), the observer step over the frame (decision 5, Q6), m_E, the handover (default
-   E), the restart CMP1 for A2 (ON-OFF: now, A1 is running; OFF-ON: right after the frame's end), the
-   estimator reseed (Q7), the return-commit and grid-alignment checks. A1 runs with the resume CMP1
-   (Ieq_plan), A2 with Ieq_end's. STOP during a frame: the frame and D finish, then the stop.
-   Without learning: if the D pass ends so late that B's sample is already waiting (counter past 2048
-   ticks), the TOC code reads B and holds the duty one more period (`d_hold`, stage 2b, S2B-Q5).
-7. **Learning periods** (with `learn_enable`; stage 2b, decision S2-Q6): the duty stays held (the
-   restart CMP1 repeats), PIs and estimator frozen, the observer held (one normal step at B, the first
-   sample after D, for m_B; the catch-up step at the end), every sample read. Jobs, one stage between
-   two polls: kappa (at E = D), G's Jacobian (started at F), then after B G's teach and q (S = B for
-   both orders). At most `BUCK_TOC_LEARN_PERIODS` = 16 samples; a job not done then, or after a sample
-   read late, is dropped (`learn_late`). Then, as after a rejected plan, the TOC code reads one more
-   sample and returns right after it (the next normal pass then has a full period).
-
-Frame encoding (register ticks from the frame's start, DT = 272; Inc/buck_toc_frame.h)
-| | ON-OFF | OFF-ON |
+What the user asked for (30 Oct) and where it is
+------------------------------------------------
+| # | request | implementation |
 |---|---|---|
-| SET1R / RST1R | PER / CMP1 | CMP2 / CMP1 (no PER set: no null-duty exception; no reset on CMP3) |
-| PER' = MPER' | on + off | DT + off + on + 8960 - resume |
-| CMP1' | DT + on | DT + off + on (= D) |
-| CMP2' | 0xFFDF (unused) | off |
-| CMP3', CMP4' (ADC1 pair) | PER' - 538, - 1920 more | CMP1' - 538, - 1920 more |
-| MCMP1..4' (ADC2) | 4 samples in the last span: (2j+1)/8 of it if ≥ 4 x 1920 ticks, else 1920 apart ending half a gap before its end | same |
-Limits (a violation = no TOC, default H): ON ≥ 368, OFF ≥ 640, 1812 ≤ PER' ≤ 63455, the first ADC1
-trigger ≥ 1920, the first ADC2 trigger ≥ 1120, ADC2 triggers ≥ 1920 apart and ≥ 600 before PER'. Every
-frame has exactly 2 ADC1 and 4 ADC2 triggers (the TROVS groups never slip). Since stage 2b the encoder
-also returns the split of the four ADC2 instants by span (`n1, sum1, sum2`).
+| - | PI, observer and score every cycle at 600 kHz; no Padé estimator | `Inc/buck_ctrl.h`, `Src/buck.c` (unchanged loop; Padé gone since stage 3) |
+| - | a look-up table to speed up the TOC if needed | not needed: the solve is one VSQRT (14 clocks) and products of constants formed once per V_ref (`buck_toc_k_init`); a table would not be faster |
+| - | simple L-C model / charge balance for t_on, t_off | `Inc/buck_toc.h` (`buck_toc_solve1/2`, formulas below) |
+| 1 | no delay: at the trigger cycle turn the top side on at once (step-up) or the bottom side (step-down) for at least the time the solve needs, feed-forward | `Inc/buck_toc_start.h`: the edge test runs before the pass's PIs, the SST/SRT is the first thing after it; the span's end comes from the solve (its minimum is the solve's time, ~0.51 us) |
+| 3 | the solve's initial condition: the measured i_L average and v_out | x0 = (i_avg, v_out) of the pass that saw the edge; I_eq = i_avg - (C/T)(v_out - v_out,prev) + b[order] |
+| 4 | the Jacobian is updated from the voltage error at the TOC's end and the difference over the first cycle after it; the first duty held | z_v = v_out(end) - V_ref; P1 (and P2, the pipeline) at the held duty (V_ref + r_L I_eq)/V_in. Since 4b the "difference" is split with P1's measured mean current i_P1: the landing z_i = i_P1 - I_eq for the timing (Newton step on g = {g_on, g_off}, `buck_toc_learn`), the equilibrium e = I_load - I_eq, I_load = i_P1 - (C/T)(v_1 - v_end), for b |
+| 4b | bring back the additive equilibrium correction: I_eq = estimate + b, b += mu_b (I_load - I_eq); split the work over cycles if needed | `buck_toc_learn_b` (mu_b 0.5, b within +-3 A, one per order); b at once (~10-15 clocks), the Jacobian step in two parts in the spare tails of the next ordinary passes, which the TOC code runs itself (`toc_pass`) |
+| 5 | i_ref = the first cycle's average current; no i_ref learner | the voltage PI's integrator := P1's measured mean current, the current PI's := the held duty, at the sample after P1; DeltaI, kappa, q and the old G bank are removed |
+| 31 Oct | the edge pass's observer step in the edge cycle itself (not deferred to the TOC code) | `Src/buck.c` run_pass: after the start (the frame's words and the return words are in), the observer step on the edge's sample, A2 and D4, as an ordinary pass makes them (~21 clocks, inside the frame, on every path of the start); `buck_toc_finish` no longer steps it |
 
-HRTIM configuration change (all builds): the master is preloaded with update at the roll-over
-(PREEN | MREPU) and Timer A updates on the master update (MSTU instead of TREPU), CMP2 = 0xFFDF. With
-equal periods (always) this is the same roll-over as before (bench test T2 below).
+The sequence (Inc/buck_toc_fw.h)
+--------------------------------
+Pass n reads the sample at the end of period n-1 (EOC ~1150 ticks into period n).
+1. **Edge (inline in the HOLD pass, before its PIs).** trig (the previous pass had g = 0, the TOC is enabled,
+   the hold-off is over) and S(v_out) >= S_th: the start (`buck_toc_start_inline`). The pass writes no CMP1
+   (the frame replaces the period it would be for; the PIs restart after the frame). Not in the first pass
+   after arming, the pass after a tunables pass, or during a reference ramp (those copies have no edge test).
+2. **The first span, now.** The peak (ON) / valley (OFF) limit from i0 (a few clocks), then ON-OFF (v < V_ref):
+   SST, the high side on after DT; OFF-ON: SRT, the high side off. Until the first update the span's end is the
+   backstop every normal period carries: Timer A CMP2 = 8320 ticks in RST1R (a no-op in a normal period; it only
+   matters if the CPU stalls).
+3. **The solve's first span** (one VSQRT), clamped to the limit; the provisional frame (the order's SET1R/RST1R,
+   PER' and MPER' far away); the counter; the span's end CMP2 = c_s + DT + t1 (ON-OFF) / c_s + t1 - DT (OFF-ON),
+   no earlier than the counter + 1024 ticks; **first software update** (CR2 = MSWU | TASWU), guarded: before the
+   span's end and before the backstop. A miss ends the forced span at once (SRT) and restores the normal words:
+   a LATE reject, no fault.
+4. **The second span** (as solved, or, when the first span came out longer than solved or at its limit, the one
+   that lands the current on the target valley from where the first ended), the frame's end PER' (ON-OFF:
+   CMP2 + t2 - DT; OFF-ON: CMP2 + DT + t2, the high side then stays on into P1), the held duty for P1 and P2;
+   then the counter (`c2`, after the period's own A0 pair has been triggered: counter >= 8678, moving its second
+   trigger first would split the TROVS group). PER' no earlier than c2 + `BUCK_TOC_END_LEAD_TICKS` (5632 ticks:
+   the second update's and the return words' path, below); the A0 pair moved to PER' - 2458 / PER' - 538;
+   **second software update**, before the provisional end. **The OFF-ON tail** (31 Oct): when PER' had to move
+   later in an OFF-ON frame, the high side would stay on to the moved end; instead the ON span ends as solved
+   (no earlier than c2 + 2048 ticks), through Timer A CMP1 as its reset (RST1R = CMP1 from this update), and the
+   rest of the frame runs with the low side on, P1 as after ON-OFF (`sat` 16).
+5. `buck_toc_ret()` right after the update (BUCK_TOC_CALL_CORE: no floating point in it, so no FP save): the
+   return words for P1 (normal period, CMP1 = the held duty; after OFF-ON without DT: the high side is on across
+   the end), guarded against PER' - 512 (miss: fault 9); then the period's own A0 result, converted inside the
+   frame, is read and dropped (`toc.v_mid`). Then, still in the edge pass (`run_pass`): the frame's record, and
+   the pass's observer step on the edge's sample, A2 and D4 (g = 1), as in an ordinary pass.
+6. `buck_toc_finish()` (after run_loop copied its state into the mailbox): **T** (the frame's end sample, read in
+   P1): the frame-end transfer seen (MUPD, UPD), the grid locked (Timer A - master counter), CMP1 for P2 = the
+   held duty (guarded, fault 5 on a miss), z_v, the observer's v^ set to it; then, in P1's idle time, the checks of
+   debugger writes to `g` and `b` (`toc_gains_take`);
+   **1** (the sample after P1, read in P2, `toc_pass`): integ_v := P1's measured mean current, integ_i := the held
+   duty, an ordinary pass (both PIs, CMP1 for P3 guarded, score, observer, A2, D4); the residuals z_v, z_i, e and
+   the equilibrium correction b at once. **Learning in parts** (with `learn_enable`, P1's mean current >=
+   `BUCK_TOC_LEARN_IMIN_A` 0.5 A: A1 reads a negative valley as 0): the Jacobian step's span steps (part 1) and its
+   gains (part 2), each started only with the counter in [2048, 7488) and no sample pending; otherwise the TOC code
+   runs the next sample's ordinary pass first (`toc_pass`, at most 4). Typically: P3's pass, part 1 in its tail,
+   P4's pass, part 2 in its tail, then back to run_loop before P5's sample. The new gains and b take effect at the
+   next edge. A new request needs g to fall and BUCK_TOC_HOLDOFF_PASSES (128) passes (the telemetry pass re-enables).
+The master's four current compares are untouched: they all fire once in the stretched period (ADC2's group stays
+four samples; its frame result is not used, and A1 cannot read negative current anyway).
 
-Learning
---------
-- **DeltaI** (SPEC 177-187): inline in every normal HOLD pass with `learn_enable` (taken from
-  `g_buck.toc.learn_enable` in the telemetry pass, every 64 passes), the constant-gain step KD =
-  -40.08 A/V, raw-load gate 1 A. Paused for 96 passes after each frame.
-- **kappa, G, q** (stage 2b): in the learning periods after D (step 7 above), published at once:
-  `g_buck.toc.kappa`, `g[order][0..1]`, `q[order]`, counted in `kappa_n, g_n, q_n` / `kappa_rej, g_rej,
-  q_rej` (gates), `learn_late` (dropped). Evidence (emulator, 1.0, `stage2b/learning_evidence.txt`):
-  learn_steps 11 frames: kappa 0 → 0.166 (11 updates), g[ON-OFF] → 1.067/1.083, g[OFF-ON] →
-  0.984/1.061 (11), q_valley → 0.10 (2 published, 9 rejected by the endpoint gate); learn_q_valley,
-  learn_q_valley2: kappa, G and q_valley published, no job dropped; learn_gate_step: a 10 A step while
-  the frame is planned, q rejected by its gate; learn_late: a late sample in the learning periods, the
-  jobs left dropped, no fault; q_peak (learn_q_peak_gate): rejected by the gate in the default build,
-  published (+0.05, the cap) in the test build with the gates widened.
-- The learning stages (stage 2 code, unchanged math) are kept from the stage-2 jobs; the stage-2
-  "learning slices" after normal passes are gone (run_loop's forced-pass path stays, unused, S2B-Q6).
-- A new request cannot come during the learning periods; requests use the published coefficients.
+The solve and the learning (Inc/buck_toc.h)
+-------------------------------------------
+Lossless L-C, the output at V_ref during the pulse: ON di/dt = m1 = (V_in - V_ref)/L, OFF -m2 = -V_ref/L. a =
+i0 - I_eq = (C/T)(v_out - v_out,prev) - b, dv = V_ref - v0, h = half the ripple at V_ref/V_in. Target: the periodic
+steady state at a period start, (I_eq - h, V_ref), so P1 is an ordinary period.
+- ON-OFF: x^2 = k_dv dv + (V_ref/V_in) a^2 + ((V_in - V_ref)/V_in) h^2, t_on = (x - a)/m1, t_off = (x + h)/m2;
+- OFF-ON: y^2 = ((V_in - V_ref)/V_in) a^2 + (V_ref/V_in) h^2 - k_dv dv, t_off = (a + y)/m2, t_on = (y - h)/m1;
+k_dv = 2 C (V_in - V_ref) V_ref/(L V_in). Applied: t = g t*, g[order] = {g_on, g_off}.
+Learning (with `learn_enable`), three measured residuals after P1 (held duty), three parameters:
+
+| residual | measured | moves |
+|---|---|---|
+| z_v (V) | v_end - V_ref | timing gains g |
+| z_i (A), the landing | i_P1 - I_eq (P1's measured mean current against the planned equilibrium) | timing gains g |
+| e (A), the equilibrium | I_load - I_eq, I_load = i_P1 - (C/T)(v_1 - v_end) (P1's mean current minus its capacitor current) | b |
+
+The voltage change over P1 alone, (C/T)(v_1 - v_end) = z_i - e, is both errors in one number; with i_P1 they
+separate: a wrong I_eq lands as planned (z_i, z_v ~ 0) but shows in e; a timing error moves z_i and z_v, not the
+measured load. Timing: the L-C end map z_i = a + h + q1 t1 + q2 t2, z_v = -dv + (a (t1 + t2) + q1 t1^2/2 + q1 t1 t2
++ q2 t2^2/2)/C (q = the spans' slopes); Newton step [dt1; dt2] = -mu J^-1 [z_i; z_v] at the applied spans, g += g
+dt/t, mu 0.25, |dg| <= 0.25 per frame, g in [0.4, 2.5] (wide: the board's fall is steeper than V_ref/L). A first
+span that was clamped (its limit, or longer than solved) cannot move: the second span alone takes z_i. Two
+divisions (1/det, 1/(t1 t2)). Equilibrium: b[order] += 0.5 e, |b| <= 3 A. What b takes: the systematic error of the
+edge estimate (a load still slewing when the edge fires, the ESR term of the edge cycle's dv, the edge's place in
+its period). Not a current-sense offset or gain: those are in I_eq and I_load alike and cancel (and the pulse
+depends on current differences only). Gates for both: |residual| >= 6 A or |z_v| >= 0.2 V (or not finite):
+nothing learned; clips 2 A / 40 mV; P1's mean current below 0.5 A: nothing learned (`learn_low`).
+
+Clock budget (static count of the linked ELF; 1 clock per instruction, loads 2, VSQRT 14, taken branch 3, no
+peripheral wait states: add ~3 per HRTIM read, the bench of Part 2 measures them)
+---------------------------------------------------------------------------------------------------------------
+| path | clocks | where in the period |
+|---|---|---|
+| normal pass, head -> CMP1 write: HOLD copy (with the edge test, TOC enabled) / other copies | 74 / 57-61 | (stage 3: 62 / 57-61) |
+| edge pass: head -> the start's counter read | 48 | ~2700 ticks |
+| -> SST (ON-OFF) / SRT (OFF-ON) | 19 / 21 | **~3350 ticks (0.62 us into the period, ~0.4 us after the sample's EOC)** |
+| SST -> the solve's counter read (solve with b, provisional words) | 62 | |
+| -> the first update's guard read | 20 | first update ~6100 ticks (limit 8256) |
+| minimum first span (solve + guard 1024 ticks - DT) | | **~2740 ticks = 0.51 us** |
+| first update -> the wait for counter 8678 (second span, the held duty), ON-OFF / OFF-ON | 87 / 94 | the wait does not wait: c2 ~9000 / ~9150 ticks |
+| c2 -> second update (ON-OFF / OFF-ON / OFF-ON with the tail) | 34 / 29 / 46 | budget `BUCK_TOC_SWU2_PATH_TICKS` 80 clocks (with ~3 wait clocks per HRTIM access) |
+| c2 -> the return words' guard read (`buck_toc_ret`) | 82 / 77 / 94 | budget `BUCK_TOC_RET_PATH_TICKS` 160 clocks, + the guard's 512 ticks: PER' >= c2 + 5632 ticks (~14700) |
+| after the return words: the record, the edge pass's observer step, A2, D4 | 65 (observer ~21) | ~13900 ticks, inside the frame |
+| T: sample read -> CMP1 (P2) write | ~50 | ~2900 ticks into P1 (deadline 8448) |
+| 1 (restart pass, `toc_pass`): sample read -> CMP1 (P3) write / -> its end | 90 / +71 | CMP1 ~4100, end ~6650 ticks into P2 |
+| residuals, telemetry, b | ~106 | ends ~1050 ticks into P3 |
+| ordinary pass run by the TOC code (`toc_pass`) | 90 / +71 | CMP1 ~4100, end ~6650 |
+| learning part 1: gates, clips, Jacobian, 1/det, the span steps | ~96 | in P3's tail (start window 2048..7488) |
+| learning part 2: 1/(t1 t2), the gains, stores | ~90 | in P4's tail; back to run_loop before P5's sample |
+
+Without the split the Jacobian step (~190 clocks) after the restart pass would end ~170 clocks into P3 and push
+P3's CMP1 write to within a few clocks of its deadline (more with wait states). The checks of debugger writes to
+`g` and `b` (`toc_gains_take`, ~100 clocks) run in P1 after T's CMP1 write (31 Oct; before the frame's end they
+could push a short frame's T pass toward its deadline).
+
+**31 Oct: the frame's end was too early for the return words.** Until 31 Oct PER' had to be only the A0 lead + one
+guard (3482 ticks, ~93 clocks) after c2, but from c2 to the return words' guard read were ~158 clocks static (the
+second update, the record stores, BUCK_TOC_CALL's FP save, the held duty inside `buck_toc_ret`), and the second
+update's own path (35 clocks) had no margin against the moved A0 trigger: a frame ending within ~0.4 us of that
+bound (every OFF-ON frame of a down step up to ~2 A in the simulation, which does not model this timing) would
+have tripped fault 9. Now the held duty is formed before the wait, `buck_toc_ret` comes right after the update
+without an FP save (82 clocks instead of 158), and the bound is sized to the path (`make check` rule 5d: the call
+within 12 instructions of the update, no FP register in `buck_toc_ret`). The frame's minimum moved later (c2 +
+5632 instead of + 3482), which made the OFF-ON frames' stretched ON span visible: on a 1 A down step the hump was
+248 mV against the PI's 70 mV (the high side on to the moved end), hence the tail.
+`BUCK_TOC_START_LAST` = 4672 (a later edge is LATE), the guard 1024 ticks (`BUCK_TOC_SWU_GUARD_TICKS`).
+`make check` (rule 5d) fails if the forced output store does not precede the solve's square root, if
+`buck_toc_ret` is not called through BUCK_TOC_CALL_CORE within 12 instructions after a guarded second update or
+uses a floating-point register, or if the OFF-ON tail compare (CMP1, then RST1R = CMP1; exempt from rule 3's
+deadline form) is missing or not followed by a guarded update. Each of these was broken once on purpose and fails
+it (31 Oct; also the simulation without the tail fails its 1 A check).
+
+Host simulation (`make toc-test`, the switched plant of Part 2 with r_L = 114 mOhm and body diodes, the
+firmware's frame timing; S = (e_v/20 mV)^2)
+---------------------------------------------------------------------------------------------------------
+| case | dip / hump, PI alone | dip / hump, TOC |
+|---|---|---|
+| 1 -> 3 -> 1 A | 132 / 132 mV | 80 / 51 mV (up: LATE, the solved on-time is below the minimum first span; down: the tail) |
+| 1 -> 6 -> 1 A | 304 / 307 mV | 166 / 74 mV (peak i_L 9.6 A) |
+| 1 -> 3 -> 1 A, ADC noise +-2 LSB | | 88 / 59 mV |
+| 1 -> 2 -> 1 A | 72 / 70 mV | 72 / 41 mV (down: the tail; with the ON span to the moved end 248 mV) |
+| 1 -> 2.5 / 1 -> 1.5 A (not in `make toc-test`) | 104 / 102, 36 / 34 mV | 79 / 43, **63** / 39 mV |
+
+The 0.5 A step up is worse with the TOC than without: its ideal on-time is far below the minimum first span
+(0.51 us), and the second span cannot take the excess out in time (Known limits).
+
+Learning (timing and b) over 16 load cycles, the last step against the same step without learning (dip / hump):
+
+| case | without learning | learned | g_off (ON-OFF) | b up / down |
+|---|---|---|---|---|
+| 1 -> 3 -> 1 A | 80 / 51 mV | **25 / 49 mV** | 0.64 | -0.00 / -0.02 A (nothing to correct) |
+| plant L -20 % | 80 / 48 mV | 26 / 51 mV | 0.67 | -0.09 / +0.12 A |
+| 10 us slewing edges | 98 / 75 mV | **26 / 49 mV** | 0.64 | +0.39 / -0.36 A (e 0.42 -> -0.03 A) |
+| 2 A / 5 A alternating (the 5 A step) | 166 / 74 mV | 54 / 63 mV | 0.61 | +0.41 / -0.39 A |
+| 5 mOhm ESR | 31 / 20 mV | 69 / 29 mV | 0.74 | -2.14 / +1.03 A (e -2.88 -> 0.07 A) |
+
+The 2 A down step's frame is valley-limited and now ends with the tail, so its timing has nothing to learn
+(z_v ~+27 mV stays). b alone moves, and with L -20 % its correct I_eq removes a small bias that had covered part
+of that shortfall: the hump 48 -> 51 mV (the check allows 10 %). These results depend on the frame's minimum, and
+not monotonically: with a 144-clock budget instead of 160 the 2 A down frames end without the tail and the slewing
+case learns to 43 / 63 mV.
+
+The unlearned 2 A step is LATE: the first span is the solve's minimum, and the second span removes the extra
+current by the lossless model's fall, which the plant's (steeper, with r_L) overdoes: P1 lands 1.4 A below I_eq
+and the voltage falls further. Learning g_off removes that.
+
+With ESR the edge cycle's dv carries ESR x the load step, so the unlearned I_eq is ~2-3 A high and the pulse is
+oversized, which happens to cover the lossless model's charge shortfall; b removes the bias (its job: I_eq ends at
+the measured load) and the dip goes back to the model's. An ESR term in the solve (the droop and z_v corrected by
+ESR (i_s - I_load), as STM32Prototype has) would be the next step. On a 2 A step the solved on-time is shorter
+than the minimum first span (LATE), so g_on is not learned there. OFF-ON: the first span ends at the valley limit
+(-2 A, `BUCK_TOC_IVAL_MIN_A`) and the second at its minimum: z_v stays ~+30 mV; a lower valley limit removes more
+charge (the stage's reverse current is the user's call). (The simulation learns at the restart pass; the firmware's
+parts finish two periods later, still long before the next edge, 128 passes on.)
+
+Known limits
+------------
+- The minimum first span is the solve's time (~0.51 us): smaller ideal on-times overshoot (then the second span
+  lands the current; z_v carries the excess). A 0.5 A step up comes out worse than with the PI alone (63 against
+  36 mV in simulation).
+- The frame lasts at least until c2 + 5632 ticks (~2.7 us after the period start): a shorter solved frame is
+  stretched, ON-OFF with a longer fall, OFF-ON with the tail (the ON span as solved, then the low side on). If the
+  solved ON span ends before c2 + 2048 it is lengthened to there; if the second update comes later than the
+  tail's compare (wait states beyond the 18-clock margin), the compare passes unseen and the high side stays on
+  to the frame's end, the frame as before the tail (no fault).
+- x0 is the sample at the period start (~0.6 us before the SST): the droop in between is not in the model (the
+  learner takes the systematic part).
+- The lossless model's fall is too shallow on the board (r_L i): g_off learns it (~0.7 in simulation).
+- The edge pass runs no PI; a telemetry or tunables pass that falls in an episode is skipped (the next comes 64
+  passes later).
+- `g_buck.toc.g` and `.b` written from the debugger are taken up after the next edge (checked: g outside [0.4, 2.5]
+  -> 1, b outside [-3, 3] A -> 0).
+- No ESR term in the model: with a few mOhm of ESR, b removes the edge estimate's ESR bias, which an unlearned frame
+  happens to profit from (table above).
+- The TOC code runs two to three ordinary passes itself after each learned frame (the same PI code; a telemetry
+  or tunables pass that falls there is skipped).
 
 Enabling (Live Expressions, after RUN)
 -------------------------------------
-1. Make the score fire on the transients you want: e.g. `g_buck.tune.score_a = 2500` (S = (e_v/20 mV)²
-   with S_th = 1). The default S_th = 1 with a = 1 means |e_v| ≥ 1 V (practically never).
-2. `g_buck.toc.toc_enable = 1` (read at each score edge). `g_buck.toc.learn_enable = 1` for the learning
-   (DeltaI at the next telemetry pass; kappa/G/q after the next frame).
-3. Watch `g_buck.toc.requests`, `frames`, `rej[0..5]` (none, limit, already, invalid, late, early),
-   `plan_ready` (9 - plan_ready = the spare periods), `late_svc`, `late_arm`, `d_hold`, `learn_samples`,
-   `learn_done`, `learn_late`, `arm_cnt/f_cnt/d_cnt`, `chk_commit/chk_out/chk_align`, `i_d`, `v_d`, `m_e`.
-Disable by writing 0. A fault 9 (`BUCK_FAULT_TOC`) means a hardware check failed (see below).
+1. Make the score fire on the transients you want: e.g. `g_buck.tune.score_a = 2500` (S = (e_v/20 mV)^2,
+   S_th = 1); the default a = 1 means |e_v| >= 1 V.
+2. `g_buck.toc.toc_enable = 1` (taken up at the next telemetry pass); `g_buck.toc.learn_enable = 1` for the
+   Jacobian step and b.
+3. Watch `g_buck.toc.edges`, `frames`, `rej[0..2]` (LATE, K: constants for a new V_ref being formed, NONE: no
+   pair), `sat` (1 first span at its limit, 2 longer than solved, 4 second span at a limit, 8 frame end moved
+   later, 16 with it the OFF-ON tail), `c_start`, `t1_ticks`, `t2_ticks` (with the tail: the ON span applied), `t1_model`, `t2_model`, `z_v`, `z_i` (landing), `i_load`, `e_b`, `b`,
+   `i_first`, `g`, `learn_n`, `b_n`, `learn_low`, `learn_late`, `learn_skip`, `chk_commit`, `chk_align`. A fault 9 (`BUCK_FAULT_TOC`) means a frame write window or a hardware check failed.
+`tools/live_expressions.txt` has the rows.
 
-New g_buck fields (appended after `trip_cyc`; every earlier offset unchanged; sizeof 248 → 520 B)
-`toc.toc_enable, learn_enable` (tunables); `toc.delta_i, q[2], g[2][2], kappa` (learned coefficients,
-writable); `toc.an_v, an_m, an_ic, an_loops, an_valid` (DeltaI anchor); `toc.state, edges, requests,
-frames, rej[6]`; the last plan: `plan_status, order, on_ticks, off_ticks, per_ticks, resume_cmp,
-end_cmp, x0_i, x0_v, ieq, target_i, plan_samples`; at D: `i_d, v_d, i_meas_d, i_pred_d, m_e, v_s0`;
-the guarded writes' counters `arm_cnt, f_cnt, d_cnt`; checks `chk_commit, chk_out, chk_align,
-align_ref, align_last`; learning `kappa_n, q_n, g_n, q_rej, g_rej, di_n, slice_max` (unused since 2b);
-stage 2b: `plan_ready, late_svc, late_arm, learn_samples, learn_done, learn_late, kappa_rej, d_hold,
-v_b, m_b`. New fault code 9.
+HRTIM configuration (all builds)
+--------------------------------
+The master is preloaded with update at its roll-over (PREEN | MREPU) and Timer A updates on the master update
+(MSTU); RST1R = CMP1 | CMP2 with CMP2 = 8320 (the TOC's backstop; a no-op in a normal period). With equal periods
+(always) the roll-over is the same as in Buck_disturb_obs.
 
-Clock budget (CPU clocks, 280 per period; CMP1 deadline 264 into the period)
----------------------------------------------------------------------------
-Static count of the linked ELF (count_f, Buck_disturb_obs's counter; HOLD copy), static / nominal
-(bench wait states: CCM literal +1.06, HRTIM read +3, ADC read +1, write-then-load +2). run_loop is
-the stage-2 code unchanged (the same count_f output, stage 2b):
-| pass | Buck_disturb_obs | buck_obs_apt |
-|---|---|---|
-| normal (TOC/learning off) | 135 / 142 | 145 / 152 |
-| normal, worst path (DeltaI, the PASS_TOC dispatch) | - | 266 / 287 |
-| telemetry | 169 / 176 | 182-187 / 189-194 |
-| tunables | 190-199 / 199-208 | 193-201 / 208-216 |
-| first pass after arming | 166-182 / 180-197 | 169-186 / 186-209 |
-| CMP1 write after the pass head | 62 / 67 | 63 / 68 (first pass 65 / 70) |
-| arming: counter read → first pass's guarded read | 142-145 / 149-152 | 150-153 / 164-167 |
-| run_loop entry | 115-124 | 129-138 |
-
-TOC episode (emulator, 0 wait states from CCM, scale 1; stage 2b; per call):
-| part | clocks |
-|---|---|
-| R pass from its sample read to the TOC call (pass, PASS_TOC dispatch, state copy) | ~233 |
-| event + episode entry (first request of a run: + 22) | ~65-86 |
-| request, x0 over 9 periods (affine map, 4 products per period), resume CMP1 | ~370 incl. 2 sample services |
-| cheaper planner parts 1..6 (request/clear, targets+order+form, quadratic+root, w+residual, gains+ticks, frame) | 91, 144, 102, 101, 80, 143 |
-| frame model: start, span 1, span 2, reciprocals + ADC2 value + gains | 38, 71, 74, 57 + ~70 |
-| grid reference + frame words | 23 + 66 |
-| sample service (planning/learning period) | ~47 |
-| arming after its sample (checks, flag clears, 2 guarded writes) | ~30 (`arm_cnt` 3922-4185 ticks: 122-131 clocks into the period) |
-| return words after the frame's start | 36 (`f_cnt` 2794-3214 ticks) |
-| pass F (sample, checks, observer catch-up 65, G start 63) | ~180 |
-| D pass to its CMP1 write / whole (with the checks) | ~160 / ~280 (`d_cnt` 6588-6932 ticks) |
-| learning: kappa / G stage / q start / q stage / B step / estimator period | 41 / 63-105 / 121 / 58-101 / 50 / 17 (+~45 tracking per sample) |
-| learning end / reject path: next sample read, estimator, observer catch-up, return | ~200 |
-Planning work from R's sample to "ready": ~2200 clocks = ~7.9 periods (ready after the 7th sample in
-every scenario) → 9 planning periods with the spare one. Learning periods: kappa + G ~5, q ~8 more.
-
-Clock-scale margin (emulator, every instruction slower by the factor; 40 TOC scenarios, NP = 9):
-| scale | result | frames | LATE rejects | faults |
-|---|---|---|---|---|
-| 1.00 | 40/40 OK | 65 | 2 | only the injected ones (ovr_*, cnt_*, dead_adc) |
-| 1.05 | 38/40 (learning not finished in 16 periods: dropped) | 63 | 2 | only injected |
-| 1.07 | 38/40 (same) | 63 | 2 | only injected |
-| 1.10 | 36/40 (frames lost to LATE rejects) | 51 | 24 | only injected |
-| 1.20 | 27/40 (no frame: every plan LATE) | 0 | 71 | only injected |
-(stage 2: fault 4 from 1.07 on.)
-
-Hardware checks and bench tests for RM0440 items the manual does not confirm
------------------------------------------------------------------------------
-(stage1/rm0440.txt; ES0430 errata not read.) Runtime checks (fault 9 with `BUCK_TOC_CHECK_TRIP` = 1,
-count only with 0):
-- **SET1R at the frame's first roll-over** (the OFF-ON frame has no PER set; does the boundary use the
-  new SET1R?): at F, while the counter is before CMP2', CHA1 must be low with no SET1 flag (OFF-ON) or
-  high with SET1 set (ON-OFF) → `chk_out`.
-- **Master and Timer A transfer together, and the grid stays locked**: MUPD and UPD both set at the
-  frame start and at its end (`chk_commit`); (Timer A - master) counter read back to back before and
-  after the frame within 64 ticks (`chk_align`; since stage 2b taken modulo the period: the reference is
-  read in the planning periods and may straddle a roll-over).
-- **MUDIS/TAUDIS hold the set; a late release moves it whole**: every release is guarded; the frame
-  words are written well before the arming.
-Bench tests (scope on PA8/PA9 and a spare GPIO; gates first at low bus voltage or disconnected):
-- T2.1 counter alignment: run 10^5 frames (toc_enable with score_a high and a periodic load step),
-  then check `chk_align = 0` and `align_last == align_ref`.
-- T2.2 scope a Timer A event and a master event on two pins after frames: edges within 1 tick.
-- T3.1' OFF-ON first span: trigger on the frame, zoom the first 300 ns of CHA1: no pulse; CHA1 rises at
-  off + DT and falls at done; 10^5 frames with a runt trigger.
-- T4.1 bulb over long frames: DC reference on A0, frames of 1x, 2x, 4x, 7x the period; the ADC1 sums
-  with bulb on vs off within 1 LSB.
-- T4.2 count ADC1/ADC2 EOCs per frame over 10^6 frames; no OVR.
-- T5.1 release the bracket late on purpose (debug build) and check the whole set slips by one period.
-- T6 (stage 2b) DWT cycles of the planning and learning periods on the board (`plan_ready`,
-  `learn_samples`, `late_svc`, `late_arm`): the emulator assumes 0 wait states from CCM.
-- Also: no DBGMCU freeze of HRTIM: a debugger halt inside a frame can repeat it (gates on). Halt only
-  with `toc_enable = 0`.
+Bench tests (RM0440 items the manual does not confirm; gates first at low bus voltage or disconnected)
+-----------------------------------------------------------------------------------------------------
+- B1 SST / SRT in the middle of a period act at once and go through the dead-time unit (CHA2 off before CHA1
+  on after DT; CHA1 off before CHA2 on): scope PA8/PA9 on a forced frame.
+- B2 a software update (CR2 TASWU | MSWU) mid-period transfers PER, CMP2..4, SET1R/RST1R at once in both
+  timers, keeps the counters locked (`chk_align = 0` over 10^5 frames), and a CMP2 written ahead of the counter
+  fires; a PER' beyond the old PER stretches the running period (no roll-over at 8960).
+- B3 the frame's end transfers the return words (`chk_commit = 0`), and the period's own A0 pair converts once
+  inside the frame (`v_mid`), the frame-end pair once after it; count ADC1/ADC2 EOCs per frame, no OVR.
+- B4 the normal-period CMP2 reset at 8320 never shows on CHA1 (the high side is already off).
+- B5 (31 Oct) a small load step down (~1 A, `sat` 25 = 16 + 8 + 1): CHA1 goes off at the tail compare (Timer A
+  CMP1 written in the second update with RST1R = CMP1, `t2_ticks` after the ON span's start), CHA2 on from there
+  to PER', and P1 starts as a normal period (CHA1 on after DT at its start).
+- No DBGMCU freeze of HRTIM: a debugger halt inside a frame leaves the forced span to the backstop (gates on).
+  Halt only with `toc_enable = 0`.
 
 Verification
 ------------
-- Differential emulator (scratchpad `obs_apt_toc/stage2/emu`, extended in stage 2 for HRTIM
-  preload/update, variable periods, compares, CHA1, ADC triggers): TOC/learning off ALL SAME vs
-  Buck_disturb_obs (all suites, scales 1.0/1.3/0.6, HFX vt base 0.9): `stage2b/res_suites`.
-- TOC scenarios: `stage2b/emu/TOC/tocchk.py` (generic checks G1-G5 on every run; 40 scenarios, 6 new
-  in stage 2b for the learning paths and their gates): `stage2b/res_toc9`.
-- Host tests: `make toc-test` (planner vs the double PLECS planner: 0 mismatches in 60000; residual vs
-  forward-map verification; encoder; learning math vs references; stage 2b: the cheaper planner vs the
-  full one, its parts = its polled form, the frame model in parts = stepping, the cheap ADC2 value).
-- `make check`: rule 5 extended: a guarded TOC write reaches toc_fail (fault 5) or, for the two arming
-  writes, toc_arm_late (LATE reject); no TOC function calls out of CCM (a struct initializer that GCC
-  turns into memset would run from flash: it happened once during stage 2b).
+- `make` (0 warnings), `make check` (rules 1, 2, 4 unchanged; rule 3 exempts the OFF-ON tail compare since
+  31 Oct; rule 5 rewritten for stage 4, self-tested by building the forced output after the solve: it fails;
+  the 31 Oct additions likewise, see *Clock budget*), `make test` (the base loop's suite, the Padé sections removed:
+  passes), `make toc-test` (the solve against an L-C integration in double, the Jacobian step on mismatched
+  L-C plants and in two parts = in one bit for bit, the equilibrium correction, the closed loop above: passes).
+- Not done: the differential emulator of stages 2/2b (not in this repository), the board.
 
-Files (new or changed in stage 2b)
-----------------------------------
-`Src/buck_toc.c` (the episode: inline sample service and late checks, the cheaper planner's parts, the
-frame model in parts, arming reject, learning periods, late-D hold, return after the next sample),
-`Src/buck_toc_plan.c`, `Inc/buck_toc_plan.h` (the cheaper planner and its six parts, BUCK_TOC_ORDER_RULE,
-BUCK_TOC_PLANNER_FAST), `Inc/buck_toc_frame.h` (the ADC2 instants' split), `Src/buck_learn.c`,
-`Inc/buck_learn.h` (frame model in parts, cheap ADC2 value), `Inc/buck_toc_fw.h` (9 planning, 16 learning
-periods, the late limits), `Inc/buck.h` (appended diagnostics), `Inc/buck_config.h` (the endpoint gates
-#ifndef-guarded for a test build), `Tests/test_toc.c` (section 8), `tools/check_loop.py` (rule 5c, 5e),
-`tools/live_expressions.txt`. `Src/buck.c`, `.cproject`, `.project` unchanged in stage 2b.
+Files (stage 4)
+---------------
+New: `Inc/buck_toc.h` (solve, learning, held duty), `Inc/buck_toc_start.h` (the inline start), `Tests/test_toc.c`
+(rewritten). Rewritten: `Src/buck_toc.c` (return words, finish, prime), `Inc/buck_toc_fw.h` (mailbox, guards).
+Changed: `Src/buck.c` (edge test before the PIs, the trigger word, RUN_TOC, CMP2/RST1R), `Inc/buck.h` (the TOC
+block), `Inc/buck_config.h` (TOC constants, the old frame and learning settings removed), `Tests/test_ctrl.c`
+(Padé sections removed), `tools/check_loop.py` (rule 5), `tools/live_expressions.txt`, `Makefile`. Removed:
+`Src/buck_toc_plan.c`, `Inc/buck_toc_plan.h`, `Src/buck_learn.c`, `Inc/buck_learn.h`, `Inc/buck_toc_frame.h`,
+`Tests/reference_toc.h` (the stage-2/3 planner, the DeltaI/kappa/q/G learners).
+31 Oct: `Src/buck.c` (the edge pass's observer step, A2, D4), `Inc/buck_toc_start.h` (the held duty before the
+wait, the frame's minimum from `BUCK_TOC_END_LEAD_TICKS`, the OFF-ON tail, the return words right after the second
+update, the record after them), `Src/buck_toc.c` (`buck_toc_ret` without floating point, the observer step and
+`toc_gains_take` out of the frame's end), `Inc/buck_toc_fw.h` (BUCK_TOC_CALL_CORE, `ret_cmp1`, `t_end`,
+`v_mid_code`), `Inc/buck_toc.h` (`BUCK_TOC_SAT_TAIL`), `Inc/buck_config.h` (`SWU2_PATH`, `RET_PATH`,
+`END_LEAD`, `TAIL_LEAD`, `PER0_REL` 320 -> 336 clocks), `tools/check_loop.py` (rule 3: the tail compare;
+rule 5d: the core-only call, its place, no FP in `buck_toc_ret`, the tail), `Tests/test_toc.c` (the frame's
+minimum and the tail as the firmware has them, the 1 A step).
 
 ---------------------------------------------------------------------------------------------
 
 Part 2: the base controller (Buck_disturb_obs's README, as of 29 Oct; unchanged code paths)
 ==========================================================================================
-Everything below describes Buck_disturb_obs; it applies to buck_obs_apt with TOC and learning off,
-except: the project/binary names, `g_buck` is 520 B (fields appended), the HRTIM update configuration
-above, CMP2 = 0xFFDF, the pass clocks in the table above, and `make check`'s rule 5.
+Everything below describes Buck_disturb_obs; it applies to buck_obs_apt with the TOC off, except: the
+project/binary names, `g_buck` is 400 B (the TOC block appended), the HRTIM update configuration (Part 1),
+Timer A CMP2 = 8320 in RST1R (the TOC's backstop, a no-op in a normal period), the HOLD pass's edge test
+before its PIs (Part 1, "Clock budget"), `make check`'s rule 5 and, since stage 3, **no Padé estimator**:
+the current PI's feedback is the measured four-sample cycle average ī_L,m[k] (the observer's input), the
+84 KB coefficient table and alpha_I are gone (the fields `tune.alpha_i`, `st.iv/iv_pred/avg_pred/kappa`,
+`out.eps/i_peak` stay for the layout and are unused; `out.i_avg = out.i_meas`). Where the text below
+describes the estimator, it is history.
 
 NUCLEO-G474RE buck converter — average-current-mode control at 600 kHz, load-current observer
 ==============================================================================================

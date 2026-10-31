@@ -83,3 +83,16 @@ g_buck.toc.chk_commit
 g_buck.toc.chk_align
 g_buck.toc.align_ref
 g_buck.toc.align_last
+g_buck.toc.f4_site
+g_buck.toc.f4_bad
+g_buck.toc.f4_csr
+g_buck.toc.f4_cnt
+g_buck.toc.c_swu1
+g_buck.toc.c2
+g_buck.toc.c_swu2
+g_buck.toc.c_ret
+g_buck.toc.c_t
+g_buck.toc.c_first
+g_buck.toc.c_pass
+g_buck.toc.c_back
+g_buck.toc.csr_back

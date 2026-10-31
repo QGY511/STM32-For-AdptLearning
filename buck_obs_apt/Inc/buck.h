@@ -90,6 +90,25 @@ typedef struct {
     uint32_t chk_commit;        /* the frame's end transfer not seen (MUPD / UPD) */
     uint32_t chk_align;         /* master and Timer A counters drifted apart */
     int32_t align_ref, align_last;
+    /* Fault 4 (31 Oct, diagnostics; written on the fault paths only): where the last one came from, frame or
+     * not, and the ADC status there */
+    uint32_t f4_site;           /* 0: none, or the loop's own sample timeout (buck_fatal from a pass or the arming
+                                   wait: the CPU then spins in buck_fatal); 1 a pass of the loop: a bad sample
+                                   (run_exit); 2 T, the frame-end sample, bad; 3 a pass the TOC code runs (the
+                                   restart pass, a learning pass) bad; 4 the TOC code's sample timeout
+                                   (toc_wait); 5 the period's own A0 result not converted inside the frame
+                                   (buck_toc_ret's wait) */
+    uint32_t f4_bad;            /* sites 1-3, the check's bad bits: 0x10 ADC1 overrun, 0x100000 ADC2 overrun,
+                                   0x40000 ADC2 without a result (ADC12_COMMON->CSR OVR_MST, OVR_SLV, EOC_SLV
+                                   missing) */
+    uint32_t f4_csr;            /* ADC12_COMMON->CSR there (sites 1-3 after the data reads: EOC bits cleared) */
+    uint32_t f4_cnt;            /* Timer A counter there */
+    /* Board timing of the last frame (31 Oct; Timer A counter, ticks, 8960 per period; the frame's own counter
+     * runs on past 8960 to PER'): the first update's guard, the read after the second update's wait, the second
+     * update's guard, the return words' guard (the frame's counter); T's CMP1 write (P1's counter), the restart
+     * pass's (P2's), the last pass the TOC code ran (c_pass), the counter when the loop takes over (c_back,
+     * the period unknown) and ADC12_COMMON->CSR there (EOC_MST 0x4 set: its sample is already waiting) */
+    uint32_t c_swu1, c2, c_ret, c_t, c_first, c_pass, c_back, csr_back;
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.

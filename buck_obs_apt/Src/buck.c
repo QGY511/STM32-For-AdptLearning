@@ -434,6 +434,8 @@ static COLD_CODE void trip(buck_t *b, uint32_t code)
 static COLD_CODE void run_exit(buck_t *b, uint32_t bad)
 {
     if (bad) {
+        b->toc.f4_site = 1U; b->toc.f4_bad = bad;                /* diagnostics (31 Oct) */
+        b->toc.f4_csr = ADC12_COMMON->CSR; b->toc.f4_cnt = TIMER_A.CNTxR;
         ADC1->ISR = ADC_ISR_OVR;
         ADC2->ISR = ADC_ISR_OVR | ADC_ISR_EOC;
         ++b->adc_miss;

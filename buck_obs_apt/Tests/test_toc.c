@@ -291,15 +291,20 @@ static void plan_normal(span_plan_t *sp, uint32_t cmp, int hs_at_start)
     sp->per = BUCK_HRTIM_PERIOD;
 }
 
-/* Firmware timing of the start (README "Clock budget": the linked code, static count): the SST/SRT at
- * this counter value, and the solve's counter read this many ticks after it (the first span's end then
- * lies at least BUCK_TOC_SWU_GUARD_TICKS beyond that). */
-#define SIM_C_S_TICKS     3350U
-#define SIM_SOLVE_TICKS   1984U
-/* ... and the counter read after the second update's wait this many ticks after the SST (the held duty is
- * formed before the wait: 88 + 90-96 + 3 clocks static, so the wait does not wait), or at
- * BUCK_TOC_SWU2_FIRST if later; the frame's end at least BUCK_TOC_END_LEAD_TICKS after that read */
-#define SIM_WAIT_TICKS    (32U * 184U)
+/* Firmware timing of the start: the SST/SRT at this counter value, the solve's counter read this many
+ * ticks after it (the first span's end then lies at least BUCK_TOC_SWU_GUARD_TICKS beyond that), and the
+ * counter read after the second update's wait this many ticks after the SST (or at BUCK_TOC_SWU2_FIRST if
+ * later; the frame's end at least BUCK_TOC_END_LEAD_TICKS after it). Two sets: the static count of the
+ * linked code (README "Clock budget"), and as measured on the board (31 Oct, one frame: g_buck.toc.c_start,
+ * PER' - BUCK_TOC_END_LEAD_TICKS; the solve's read is not measured: 62 clocks x 1.36, the factor measured
+ * from the SST to the read after the wait). */
+typedef struct { uint32_t c_s, solve, wait; const char *name; } sim_timing_t;
+static const sim_timing_t SIM_STATIC = { 3350U, 1984U, 32U * 184U, "static count" };
+static const sim_timing_t SIM_BOARD = { 4352U, 32U * 84U, 8064U, "board, measured 31 Oct" };
+static sim_timing_t sim_tm = { 3350U, 1984U, 32U * 184U, "static count" };
+#define SIM_C_S_TICKS     (sim_tm.c_s)
+#define SIM_SOLVE_TICKS   (sim_tm.solve)
+#define SIM_WAIT_TICKS    (sim_tm.wait)
 
 typedef struct {
     double t_up, t_down, t_end, i_base_R, i_step, L_plant, rl_plant;
@@ -459,10 +464,12 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
                 if (per < plo) {
                     per = plo; sat |= BUCK_TOC_SAT_PER;
                     if (!on_off) {
+                        /* the solved end by the compare if far enough ahead, else ended by SRT at the read
+                         * (~10 clocks later on the board); never later than either */
                         t_end = cmp2 + BUCK_DT_TICKS + t2;
-                        if (t_end < c2 + BUCK_TOC_TAIL_LEAD_TICKS) t_end = c2 + BUCK_TOC_TAIL_LEAD_TICKS;
-                        t2 = t_end - cmp2 - BUCK_DT_TICKS;
                         sat |= BUCK_TOC_SAT_TAIL;
+                        if (t_end < c2 + BUCK_TOC_TAIL_LEAD_TICKS) { t_end = c2 + 32U * 10U; sat |= BUCK_TOC_SAT_TAIL_NOW; }
+                        t2 = (t_end > cmp2 + BUCK_DT_TICKS) ? t_end - cmp2 - BUCK_DT_TICKS : 0U;
                     }
                 }
                 /* the frame: the period's own on-time, then the first span from c_s, the second, the end */
@@ -537,9 +544,13 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
     memcpy(res->b, bq, sizeof bq);
 }
 
+static void test_closed_loop_board(void);
+
 static void test_closed_loop(void)
 {
     const double R1 = BUCK_VREF_COUNTS_DEFAULT * BUCK_V_PER_COUNT;   /* 1 A at V_ref */
+    sim_tm = SIM_STATIC;
+    printf("closed loop, the start's timing: %s\n", sim_tm.name);
     const struct { tscen_t s; } sc[] = {
         { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 3 -> 1 A, PI alone", 0, 0, 0 } },
         { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 3 -> 1 A, TOC", 0, 0, 0 } },
@@ -617,11 +628,67 @@ static void test_closed_loop(void)
     }
 }
 
+/* The same steps with the start's timing measured on the board (31 Oct): the first span's minimum is ~0.64 us
+ * (the current to the 10 A limit on every step up, then the second span takes it back), the frame's end is
+ * later. Checked: the peak current, the tail on the down steps, learning's effect on the dip; the dips of the
+ * unlearned small steps up are reported, not checked (worse than the PI's at 1 A: README Known limits). */
+static void test_closed_loop_board(void)
+{
+    const double R1 = BUCK_VREF_COUNTS_DEFAULT * BUCK_V_PER_COUNT;
+    sim_tm = SIM_BOARD;
+    printf("closed loop, the start's timing: %s\n", sim_tm.name);
+    const tscen_t sc[] = {
+        { 13e-3, 15e-3, 17e-3, R1, 1.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 2 -> 1 A, PI alone", 0, 0, 0 },
+        { 13e-3, 15e-3, 17e-3, R1, 1.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 2 -> 1 A, TOC", 0, 0, 0 },
+        { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 3 -> 1 A, PI alone", 0, 0, 0 },
+        { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 3 -> 1 A, TOC", 0, 0, 0 },
+        { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 6 -> 1 A, PI alone", 0, 0, 0 },
+        { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 6 -> 1 A, TOC", 0, 0, 0 },
+        { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 2, 1, 0, 1, "1 -> 3 -> 1 A, TOC, ADC noise +-2", 0, 0, 0 },
+    };
+    tres_t r[sizeof sc / sizeof sc[0]];
+    for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; ++i) {
+        srand(21);
+        run_loop_sim(&sc[i], &r[i]);
+        printf("[board: %s] dip %.1f mV, hump %.1f mV; i_L %.2f .. %.2f A; frames %ld (first span late %ld, end at its "
+               "minimum %ld)\n", sc[i].name, r[i].dip * 1e3, r[i].hump * 1e3, r[i].imin, r[i].imax, r[i].frames,
+               r[i].late, r[i].per_sat);
+        if (sc[i].toc)
+            CHECK(r[i].frames >= 2 && r[i].imax < BUCK_TOC_IPK_MAX_A + 1.0, "board: %s: frames, peak within the limit",
+                  sc[i].name);
+    }
+    CHECK(r[1].hump < 0.7 * r[0].hump && r[3].hump < 0.7 * r[2].hump && r[5].hump < 0.7 * r[4].hump,
+          "board: the down steps' humps below the PI's (the tail)");
+    CHECK(r[5].dip < 0.7 * r[4].dip, "board: TOC cuts the 5 A dip");
+    const tscen_t lr[] = {
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 16 x (1 -> 3 -> 1 A)", 0, 0, 0 },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 1.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 16 x (1 -> 2 -> 1 A)", 0, 0, 0 },
+        { 12e-3, 12.6e-3, 12e-3 + 16 * 1.2e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 1, 16, "learning, 10 us slewing edges", 10e-6, 0, 0 },
+    };
+    for (unsigned i = 0; i < sizeof lr / sizeof lr[0]; ++i) {
+        tres_t q, q0;
+        tscen_t nolearn = lr[i]; nolearn.learn = 0;
+        srand(21); run_loop_sim(&nolearn, &q0);
+        srand(21); run_loop_sim(&lr[i], &q);
+        printf("[board: %s] g ON-OFF %.3f / %.3f; b %+.2f / %+.2f A; last step dip / hump %.1f / %.1f mV (no learning "
+               "%.1f / %.1f mV)\n", lr[i].name, (double)q.g[0][0], (double)q.g[0][1], (double)q.b[0], (double)q.b[1],
+               q.dip_last * 1e3, q.hump_last * 1e3, q0.dip_last * 1e3, q0.hump_last * 1e3);
+        /* the 1 A step up lands P1's mean current below BUCK_TOC_LEARN_IMIN_A (the 10 A peak, then the long fall):
+         * the gate keeps it from learning (A1 reads a negative valley as 0); reported, not checked */
+        if (lr[i].i_step >= 2.0)
+            CHECK(q.dip_last < 0.5 * q0.dip_last, "board: %s: learning cuts the dip", lr[i].name);
+        else
+            CHECK(q.learn_low > 0, "board: %s: the up step's landing below the learning gate", lr[i].name);
+    }
+    sim_tm = SIM_STATIC;
+}
+
 int main(void)
 {
     test_solve();
     test_learn();
     test_closed_loop();
+    test_closed_loop_board();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all tests passed", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

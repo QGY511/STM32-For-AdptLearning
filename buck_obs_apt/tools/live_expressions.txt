@@ -96,3 +96,14 @@ g_buck.toc.c_first
 g_buck.toc.c_pass
 g_buck.toc.c_back
 g_buck.toc.csr_back
+g_buck.toc.c_tw
+g_buck.toc.c_rw
+(void(*)(void))g_buck.toc.fatal_lr
+g_buck.toc.fatal_prev
+g_buck.toc.fatal_ta_per
+g_buck.toc.fatal_ta_cnt
+g_buck.toc.fatal_mper
+g_buck.toc.fatal_mcnt
+g_buck.toc.fatal_adc1_cr
+g_buck.toc.fatal_adc1_isr
+g_buck.toc.fatal_adc2_isr

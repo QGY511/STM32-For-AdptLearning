@@ -256,7 +256,12 @@ Enabling (Live Expressions, after RUN)
    `frames`, `sat`, `c_start`, `per_ticks` and `adc_miss` (counted for sites 1-3 only).
 5. The frame's timing on the board (Timer A counter, ticks): `toc.c_start` (SST), `c_swu1`, `c2`, `c_swu2`,
    `c_ret` (the frame's counter), `c_t` (T's CMP1, in P1), `c_first` (the restart pass's, in P2), `c_pass`, `c_back`
-   and `csr_back` (where the loop takes over; 0x4 set: its sample already waiting).
+   and `csr_back` (where the loop takes over; 0x4 set: its sample already waiting); `c_tw`, `c_rw` when T's and
+   the restart pass's samples arrived.
+6. A fault through `buck_fatal` (a sample timeout: fault 4 with `f4_site` 0): `toc.fatal_lr` its caller (as
+   `(void(*)(void))g_buck.toc.fatal_lr` the debugger shows the function), `fatal_prev` the fault before it (a trip
+   the stopped loop then timed out after), `fatal_ta_per` / `fatal_ta_cnt` / `fatal_mper` / `fatal_mcnt` the timers,
+   `fatal_adc1_cr` (ADSTART 0x4), `fatal_adc1_isr`, `fatal_adc2_isr`.
 `tools/live_expressions.txt` has the rows.
 
 HRTIM configuration (all builds)

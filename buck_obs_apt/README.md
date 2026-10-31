@@ -219,6 +219,12 @@ Enabling (Live Expressions, after RUN)
    pair), `sat` (1 first span at its limit, 2 longer than solved, 4 second span at a limit, 8 frame end moved
    later, 16 with it the OFF-ON tail), `c_start`, `t1_ticks`, `t2_ticks` (with the tail: the ON span applied), `t1_model`, `t2_model`, `z_v`, `z_i` (landing), `i_load`, `e_b`, `b`,
    `i_first`, `g`, `learn_n`, `b_n`, `learn_low`, `learn_late`, `learn_skip`, `chk_commit`, `chk_align`. A fault 9 (`BUCK_FAULT_TOC`) means a frame write window or a hardware check failed.
+4. A fault 4 (`BUCK_FAULT_ADC`, 31 Oct diagnostics): `toc.f4_site` says where (0 the loop's own sample timeout, the
+   CPU then spins in `buck_fatal`; 1 a pass of the loop, bad sample; 2 T, the frame-end sample, bad; 3 the restart
+   or a learning pass, bad; 4 the TOC code's sample timeout; 5 the period's own A0 result not converted inside the
+   frame), `toc.f4_bad` which check (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2 without a result),
+   `toc.f4_csr` and `toc.f4_cnt` the ADC status and the Timer A counter there; with `toc.state`, `edges`,
+   `frames`, `sat`, `c_start`, `per_ticks` and `adc_miss` (counted for sites 1-3 only).
 `tools/live_expressions.txt` has the rows.
 
 HRTIM configuration (all builds)

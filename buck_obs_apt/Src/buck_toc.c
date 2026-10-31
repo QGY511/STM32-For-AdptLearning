@@ -53,13 +53,15 @@ TOC_COLD void buck_toc_start_late(void)
 }
 
 /* Leaving the run from the TOC code: as run_exit() (Src/buck.c) after the state is written back.
- * bad: fault 4; else a STOP (gates off, CMP1 = BUCK_CMP_MIN as run_exit). */
-static TOC_COLD void toc_exit(buck_t *b, uint32_t bad, uint32_t adc_v, uint32_t adc_i4)
+ * bad: fault 4 (site: g_buck.toc.f4_site); else a STOP (gates off, CMP1 = BUCK_CMP_MIN as run_exit). */
+static TOC_COLD void toc_exit(buck_t *b, uint32_t bad, uint32_t adc_v, uint32_t adc_i4, uint32_t site)
 {
     buck_toc_mb_t *m = &g_toc_mb;
     b->adc_v_raw = adc_v; b->adc_i4_raw = adc_i4; b->loops = m->loops;
     b->st = m->s;
     if (bad) {
+        b->toc.f4_site = site; b->toc.f4_bad = bad;              /* diagnostics (31 Oct) */
+        b->toc.f4_csr = ADC12_COMMON->CSR; b->toc.f4_cnt = TA.CNTxR;
         ADC1->ISR = ADC_ISR_OVR;
         ADC2->ISR = ADC_ISR_OVR | ADC_ISR_EOC;
         ++b->adc_miss;
@@ -93,7 +95,10 @@ static TOC_CODE uint32_t toc_wait(void)
 {
     uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD, st;
     while (((st = ADC12_COMMON->CSR) & ADC_CSR_EOC_MST) == 0U) {
-        if (--n == 0U) buck_fatal(BUCK_FAULT_ADC);
+        if (--n == 0U) {
+            g_buck.toc.f4_site = 4U; g_buck.toc.f4_csr = st; g_buck.toc.f4_cnt = TA.CNTxR;
+            buck_fatal(BUCK_FAULT_ADC);
+        }
     }
     return st;
 }
@@ -136,7 +141,7 @@ static TOC_CODE uint32_t toc_pass(buck_toc_mb_t *m, buck_t *b, const buck_tune_t
     const uint32_t bad = (st & CSR_BAD) ^ ADC_CSR_EOC_SLV;
     const uint32_t adc_v = ADC1->DR, adc_i4 = ADC2->DR;
     const uint32_t cmd = *(volatile const uint32_t *)&b->command;
-    if (bad || cmd != BUCK_RUN) { toc_exit(b, bad, adc_v, adc_i4); return 1U; }
+    if (bad || cmd != BUCK_RUN) { toc_exit(b, bad, adc_v, adc_i4, 3U); return 1U; }
     if (reseed) {
         float iref0 = buck_adc_to_i_o(t, adc_i4, 0);
         iref0 = (iref0 > BUCK_IREF_MIN_A) ? iref0 : BUCK_IREF_MIN_A;   /* (a NaN ends at the lower bound) */
@@ -197,8 +202,12 @@ TOC_CODE void buck_toc_ret(void)
     {
         /* the period's own A0 pair (its EOC ~1400 ticks after its second trigger) */
         uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD;
-        while ((ADC12_COMMON->CSR & ADC_CSR_EOC_MST) == 0U) {
-            if (--n == 0U) buck_fatal(BUCK_FAULT_ADC);
+        uint32_t st;
+        while (((st = ADC12_COMMON->CSR) & ADC_CSR_EOC_MST) == 0U) {
+            if (--n == 0U) {
+                g_buck.toc.f4_site = 5U; g_buck.toc.f4_csr = st; g_buck.toc.f4_cnt = TA.CNTxR;
+                buck_fatal(BUCK_FAULT_ADC);
+            }
         }
         f->v_mid_code = ADC1->DR;
     }
@@ -252,7 +261,7 @@ TOC_CODE void buck_toc_finish(void)
         const uint32_t bad = (st & CSR_BAD) ^ ADC_CSR_EOC_SLV;
         const uint32_t adc_v = ADC1->DR, adc_i4 = ADC2->DR;
         const uint32_t cmd = *(volatile const uint32_t *)&b->command;
-        if (bad) { toc_exit(b, bad, adc_v, adc_i4); return; }
+        if (bad) { toc_exit(b, bad, adc_v, adc_i4, 2U); return; }
         /* the frame's end transfer happened (MUPD / UPD, cleared after the updates) */
         if (!(HM.MISR & HRTIM_MISR_MUPD) || !(TA.TIMxISR & HRTIM_TIMISR_UPD)) {
             ++T->chk_commit;
@@ -278,7 +287,7 @@ TOC_CODE void buck_toc_finish(void)
         T->z_v = v_end - m->vref;
         T->state = BUCK_TOCS_END;
         b->adc_v_raw = adc_v; b->adc_i4_raw = adc_i4;
-        if (cmd != BUCK_RUN) { toc_exit(b, 0U, adc_v, adc_i4); return; }
+        if (cmd != BUCK_RUN) { toc_exit(b, 0U, adc_v, adc_i4, 2U); return; }
         /* debugger writes of g / b, for the next frame (the learning below writes its results directly):
          * here, in P1's idle time after its CMP1 write (31 Oct; before the frame's end they could delay
          * this pass of a short frame toward its deadline) */

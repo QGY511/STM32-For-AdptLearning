@@ -208,10 +208,20 @@ BUCK_INLINE void buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck
     return;
 missed_start:
     /* the first update would come too late (the span's end or the backstop first; nothing transferred):
-     * the forced span ends now (ON-OFF; OFF-ON's high side stays off until the next period, as normal),
-     * the normal words back, a LATE reject */
+     * the forced span ends now (ON-OFF; OFF-ON's high side stays off until the next period, as normal), and
+     * the normal words go back here and are taken up at once by a software update (31 Oct: through
+     * buck_toc_start_late() alone, ~105 clocks on the board, a miss near the backstop restored them after the
+     * period's end, whose update took the provisional words: a period of PER0' with the order's set/reset,
+     * a long ON span). CMP1, CMP3 and CMP4 the start never wrote: the update transfers them unchanged. The
+     * counter is below 8960 then (or, past the roll-over, low): PER 8960 lies ahead either way. A LATE reject */
     if (on_off) hr->sTimerxRegs[0].RSTx1R = HRTIM_RST1R_CMP1 | HRTIM_RST1R_CMP2 | HRTIM_RST1R_SRT;
-    BUCK_TOC_CALL(buck_toc_start_late);
+    hr->sTimerxRegs[0].CMP2xR = BUCK_TOC_CMP2_BACKSTOP;
+    hr->sTimerxRegs[0].SETx1R = HRTIM_SET1R_PER;
+    hr->sTimerxRegs[0].RSTx1R = HRTIM_RST1R_CMP1 | HRTIM_RST1R_CMP2;
+    hr->sTimerxRegs[0].PERxR = BUCK_HRTIM_PERIOD;
+    hr->sMasterRegs.MPER = BUCK_HRTIM_PERIOD;
+    hr->sCommonRegs.CR2 = BUCK_TOC_SWU;
+    BUCK_TOC_CALL(buck_toc_start_late);         /* the count (and the same words again, harmless) */
     return;
 missed_frame:
     m->f.fail_cnt = cnt;

@@ -141,6 +141,19 @@ runs only with a part's time to spare at the episode's end (in P1 it delayed eve
 counter at each step is now recorded (`toc.c_swu1`, `c2`, `c_swu2`, `c_ret`, `c_t`, `c_first`, `c_pass`, `c_back`,
 `csr_back`): the next frame on the board measures the path instead of the count.
 
+**31 Oct, on the board: fault 4 after a rejected start, and after a frame.** A run without any frame tripped fault
+4 with both ADCs overrun at counter 8000 (`f4_bad` 0x100010): a start rejected after its SST (the first update's
+guard missed, likely on the board, where that update lands ~60 ticks before its limit) went through PASS_TOC,
+`buck_toc_start_late` and `buck_toc_finish` (~350 clocks static, ~1.75 periods on the board) and the loop's next
+pass found two samples unread. Every reject now ends its pass in `run_pass` itself (the observer step, A2, D4,
+the trigger word, `loops`; no PIs: the next period keeps its CMP1): before the SST (`rej[1]`, `rej[0]`) or after it
+(`rej[0]`, the normal words restored inline and taken up by a software update). The constants for a new V_ref
+are no longer formed during a run (they were, in `buck_toc_finish`, ~200 clocks): after a change of V_ref the
+TOC rejects (`rej[1]`) until the next RUN. In two runs with a frame the fault came on the second pass after it
+(`hold_until` - 128 = `loops` - 1; ADC2 overrun, no ADC2 result): the TOC code now runs two more ordinary
+passes after each frame (`BUCK_TOC_PROBE_PASSES`), so that it hands back where the loop waits for its sample, and
+its waits record the samples' arrival (`toc.pr_*`, below).
+
 **31 Oct: the frame's end was too early for the return words.** Until 31 Oct PER' had to be only the A0 lead + one
 guard (3482 ticks, ~93 clocks) after c2, but from c2 to the return words' guard read were ~158 clocks static (the
 second update, the record stores, BUCK_TOC_CALL's FP save, the held duty inside `buck_toc_ret`), and the second
@@ -224,6 +237,8 @@ Known limits
 - On the board the start barely fits its period: SST ~4352 (`BUCK_TOC_START_LAST` 4672), the first update ~8190
   (its limit 8256 before the backstop): expect LATE rejects (`rej[0]`). The minimum first span is ~0.64 us: a small
   step up overshoots to the 10 A limit (the 1 A step up worse than the PI alone, and not learnable).
+- A change of V_ref during a run disables the TOC until the next RUN (`rej[1]` counts its edges): the solve's
+  constants are formed at the run's entry only.
 - The edge estimate can be far off on the board: that frame had I_eq = -0.88 A (a negative load) from one
   cycle's dv after a late trigger (`score_a` 100: |e_v| >= 100 mV, when the PI had already cut the current).
 - x0 is the sample at the period start (~0.6 us before the SST): the droop in between is not in the model (the
@@ -262,6 +277,10 @@ Enabling (Live Expressions, after RUN)
    `(void(*)(void))g_buck.toc.fatal_lr` the debugger shows the function), `fatal_prev` the fault before it (a trip
    the stopped loop then timed out after), `fatal_ta_per` / `fatal_ta_cnt` / `fatal_mper` / `fatal_mcnt` the timers,
    `fatal_adc1_cr` (ADSTART 0x4), `fatal_adc1_isr`, `fatal_adc2_isr`.
+7. The samples' arrival in the passes the TOC code ran after the last frame (`toc.pr_n` of them; 0 is T, 1 the
+   restart pass, then the learning and the two extra passes): `pr_c0[k]` the Timer A counter when the wait began,
+   `pr_c2[k]` when ADC2's result was first seen (0xFFFF: already there), `pr_c1[k]` when ADC1's came, `pr_st[k]`
+   ADC12_COMMON->CSR then (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2's result there).
 `tools/live_expressions.txt` has the rows.
 
 HRTIM configuration (all builds)

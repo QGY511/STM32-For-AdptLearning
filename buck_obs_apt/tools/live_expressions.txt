@@ -107,3 +107,8 @@ g_buck.toc.fatal_mcnt
 g_buck.toc.fatal_adc1_cr
 g_buck.toc.fatal_adc1_isr
 g_buck.toc.fatal_adc2_isr
+g_buck.toc.pr_n
+g_buck.toc.pr_c0
+g_buck.toc.pr_c2
+g_buck.toc.pr_c1
+g_buck.toc.pr_st

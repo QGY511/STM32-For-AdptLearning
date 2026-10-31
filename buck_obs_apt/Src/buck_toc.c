@@ -36,22 +36,6 @@ static TOC_COLD void toc_trip(buck_t *b, uint32_t code)
     b->state = BUCK_FAULTED;
 }
 
-/* The first update's guard missed (Inc/buck_toc_start.h): nothing was transferred (the forced span
- * has been ended there), so the normal words go back into the preloads (CMP1 is still the period's
- * own: the pass wrote none) before the period ends (~2500 ticks after the guard's window); a LATE
- * reject, no fault. */
-TOC_COLD void buck_toc_start_late(void)
-{
-    TA.CMP2xR = BUCK_TOC_CMP2_BACKSTOP;
-    TA.CMP3xR = BUCK_VSAMPLE_CMP;
-    TA.CMP4xR = BUCK_VSAMPLE0_CMP;
-    TA.SETx1R = HRTIM_SET1R_PER;
-    TA.RSTx1R = HRTIM_RST1R_CMP1 | HRTIM_RST1R_CMP2;
-    TA.PERxR = BUCK_HRTIM_PERIOD;
-    HM.MPER = BUCK_HRTIM_PERIOD;
-    ++g_buck.toc.rej[BUCK_TOCR_LATE];
-}
-
 /* Leaving the run from the TOC code: as run_exit() (Src/buck.c) after the state is written back.
  * bad: fault 4 (site: g_buck.toc.f4_site); else a STOP (gates off, CMP1 = BUCK_CMP_MIN as run_exit). */
 static TOC_COLD void toc_exit(buck_t *b, uint32_t bad, uint32_t adc_v, uint32_t adc_i4, uint32_t site)
@@ -93,12 +77,22 @@ static TOC_COLD void toc_fail(buck_t *b, uint32_t code, uint32_t cnt)
  * wait_sample() (Src/buck.c). A frame is at most ~11 us (~1900 clocks): within the timeout. */
 static TOC_CODE uint32_t toc_wait(void)
 {
-    uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD, st;
-    while (((st = ADC12_COMMON->CSR) & ADC_CSR_EOC_MST) == 0U) {
+    buck_toc_t *const T = &g_buck.toc;
+    const uint32_t c0 = TA.CNTxR;               /* diagnostics (31 Oct): the samples' arrival, g_buck.toc.pr_* */
+    uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD, st = ADC12_COMMON->CSR;
+    uint32_t c2 = (st & ADC_CSR_EOC_SLV) ? 0xFFFFU : 0U;
+    while ((st & ADC_CSR_EOC_MST) == 0U) {
+        if (c2 == 0U && (st & ADC_CSR_EOC_SLV)) c2 = TA.CNTxR;
         if (--n == 0U) {
-            g_buck.toc.f4_site = 4U; g_buck.toc.f4_csr = st; g_buck.toc.f4_cnt = TA.CNTxR;
+            T->f4_site = 4U; T->f4_csr = st; T->f4_cnt = TA.CNTxR;
             buck_fatal(BUCK_FAULT_ADC);
         }
+        st = ADC12_COMMON->CSR;
+    }
+    const uint32_t k = T->pr_n;
+    if (k < BUCK_TOC_PROBES) {
+        T->pr_c0[k] = c0; T->pr_c2[k] = c2; T->pr_c1[k] = TA.CNTxR; T->pr_st[k] = st;
+        T->pr_n = k + 1U;
     }
     return st;
 }
@@ -232,7 +226,6 @@ TOC_CODE void buck_toc_finish(void)
     const buck_toc_frame_t *const f = &m->f;
     uint32_t cnt;
     m->ret = BUCK_TOC_RET_STATE;
-    ++T->edges;
     const uint32_t hold_cmp = f->hold_cmp;
     const float d_hold = f->d_hold;
     if (m->req == BUCK_TOC_REQ_FAIL) { toc_fail(b, BUCK_FAULT_TOC, f->fail_cnt); return; }
@@ -244,6 +237,7 @@ TOC_CODE void buck_toc_finish(void)
         T->a = f->sol.a; T->t1_model = f->sol.t1; T->t2_model = f->sol.t2; T->v_mid = (float)f->v_mid_code * VSUM;
         T->c_swu1 = f->c_swu1; T->c2 = f->c2; T->c_swu2 = f->c_swu2; T->c_ret = f->c_ret;   /* board timing */
         T->c_t = T->c_first = T->c_back = T->csr_back = T->c_tw = T->c_rw = 0U;
+        T->pr_n = 0U;
         if (!f->ok) ++T->rej[BUCK_TOCR_NONE];
         T->state = BUCK_TOCS_FRAME;
         T->align_ref = toc_align();
@@ -349,6 +343,9 @@ TOC_CODE void buck_toc_finish(void)
         }
     }
     if (part != 3U) ++T->learn_skip;            /* off, a low current, no pair, beyond SKIP, or late */
+    /* the extra passes (BUCK_TOC_PROBE_PASSES): hand back where the loop waits for its sample */
+    for (uint32_t n = 0U; n < BUCK_TOC_PROBE_PASSES; ++n)
+        if (toc_pass(m, b, &t, 0U, 0.0f, &v1, &i1)) return;
     /* debugger writes of g / b, for the next frame (the learning above writes its results directly): only with
      * a part's time to spare, as a learning part (31 Oct: in P1 after T, ~100 clocks static and more on the
      * board, it delayed every pass after it); else at the next edge's end or the run's entry */

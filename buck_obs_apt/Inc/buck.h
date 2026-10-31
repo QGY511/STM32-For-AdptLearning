@@ -109,6 +109,14 @@ typedef struct {
      * pass's (P2's), the last pass the TOC code ran (c_pass), the counter when the loop takes over (c_back,
      * the period unknown) and ADC12_COMMON->CSR there (EOC_MST 0x4 set: its sample is already waiting) */
     uint32_t c_swu1, c2, c_ret, c_t, c_first, c_pass, c_back, csr_back;
+    uint32_t c_tw, c_rw;        /* the Timer A counter when T's sample (P1) and the restart pass's sample (P2)
+                                   arrived (their waits returned) */
+    /* buck_fatal (any fault through it, e.g. a sample timeout, fault 4 with f4_site 0; 31 Oct diagnostics): its
+     * caller (return address: map it to a function with the .map / disassembly), the fault code before it (a
+     * trip the stopped loop then timed out after), and the registers when it stopped: Timer A PER and counter,
+     * the master's PER and counter, ADC1 CR (ADSTART 0x4) and ISR, ADC2 ISR */
+    uint32_t fatal_lr, fatal_prev, fatal_ta_per, fatal_ta_cnt, fatal_mper, fatal_mcnt;
+    uint32_t fatal_adc1_cr, fatal_adc1_isr, fatal_adc2_isr;
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.

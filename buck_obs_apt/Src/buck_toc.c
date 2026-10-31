@@ -138,6 +138,7 @@ static TOC_CODE uint32_t toc_pass(buck_toc_mb_t *m, buck_t *b, const buck_tune_t
     const buck_kc_t kc = buck_kc_init();
     uint32_t cnt;
     const uint32_t st = toc_wait();
+    if (reseed) b->toc.c_rw = TA.CNTxR;         /* diagnostics (31 Oct): the restart pass's sample arrived */
     const uint32_t bad = (st & CSR_BAD) ^ ADC_CSR_EOC_SLV;
     const uint32_t adc_v = ADC1->DR, adc_i4 = ADC2->DR;
     const uint32_t cmd = *(volatile const uint32_t *)&b->command;
@@ -242,7 +243,7 @@ TOC_CODE void buck_toc_finish(void)
         T->per_ticks = f->per; T->hold_cmp = hold_cmp; T->v0 = m->v; T->i0 = m->im; T->ieq = f->sol.ieq;
         T->a = f->sol.a; T->t1_model = f->sol.t1; T->t2_model = f->sol.t2; T->v_mid = (float)f->v_mid_code * VSUM;
         T->c_swu1 = f->c_swu1; T->c2 = f->c2; T->c_swu2 = f->c_swu2; T->c_ret = f->c_ret;   /* board timing */
-        T->c_t = T->c_first = T->c_back = T->csr_back = 0U;
+        T->c_t = T->c_first = T->c_back = T->csr_back = T->c_tw = T->c_rw = 0U;
         if (!f->ok) ++T->rej[BUCK_TOCR_NONE];
         T->state = BUCK_TOCS_FRAME;
         T->align_ref = toc_align();
@@ -262,6 +263,7 @@ TOC_CODE void buck_toc_finish(void)
     float v_end;
     {
         const uint32_t st = toc_wait();
+        T->c_tw = TA.CNTxR;                     /* diagnostics (31 Oct): T's sample arrived (P1's counter) */
         const uint32_t bad = (st & CSR_BAD) ^ ADC_CSR_EOC_SLV;
         const uint32_t adc_v = ADC1->DR, adc_i4 = ADC2->DR;
         const uint32_t cmd = *(volatile const uint32_t *)&b->command;

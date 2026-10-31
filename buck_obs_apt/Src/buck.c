@@ -400,6 +400,20 @@ void buck_start(void)
 void buck_fatal(uint32_t reason)
 {
     __disable_irq();
+    /* diagnostics (31 Oct): who called, what was latched before, and the timers' and ADCs' state */
+    g_buck.toc.fatal_lr = (uint32_t)__builtin_return_address(0);
+    g_buck.toc.fatal_prev = g_buck.fault;
+    if (RCC->APB2ENR & RCC_APB2ENR_HRTIM1EN) {
+        g_buck.toc.fatal_ta_per = TIMER_A.PERxR;
+        g_buck.toc.fatal_ta_cnt = TIMER_A.CNTxR;
+        g_buck.toc.fatal_mper = HRTIM_MASTER.MPER;
+        g_buck.toc.fatal_mcnt = HRTIM_MASTER.MCNTR;
+    }
+    if (RCC->AHB2ENR & RCC_AHB2ENR_ADC12EN) {
+        g_buck.toc.fatal_adc1_cr = ADC1->CR;
+        g_buck.toc.fatal_adc1_isr = ADC1->ISR;
+        g_buck.toc.fatal_adc2_isr = ADC2->ISR;
+    }
     if (RCC->APB2ENR & RCC_APB2ENR_HRTIM1EN)
         HRTIM_COMMON.ODISR = HRTIM_ODISR_TA1ODIS | HRTIM_ODISR_TA2ODIS;
     RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN | RCC_AHB2ENR_GPIOBEN;

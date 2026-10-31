@@ -55,6 +55,12 @@
  * never delays the pass of a sample that is about to arrive. */
 #define BUCK_TOC_LEARN_PART_FIRST 2048U
 #define BUCK_TOC_LEARN_PASSES   4U
+/* After a frame the TOC code runs this many more ordinary passes before it hands back (31 Oct): it hands back at
+ * a point where the loop waits for its sample (the residuals end after the next sample's EOC: the loop's first
+ * pass then read it late, and on the board the second pass after a frame found ADC2 overrun), and each pass it
+ * runs records its samples' arrival (g_buck.toc.pr_*). */
+#define BUCK_TOC_PROBE_PASSES   2U
+#define BUCK_TOC_PROBES         6U
 
 enum { BUCK_TOC_RET_STATE = 0U, BUCK_TOC_RET_EXIT = 1U };
 enum { BUCK_TOC_REQ_NONE = 0U, BUCK_TOC_REQ_FRAME = 1U, BUCK_TOC_REQ_FAIL = 2U };
@@ -109,7 +115,6 @@ extern buck_toc_mb_t g_toc_mb;
 void buck_toc_finish(void);     /* after the start: the record, that pass's bookkeeping and, with a frame,
                                    its two samples */
 void buck_toc_prime(void);      /* run_loop's entry: the constants for g_toc_mb.vref, the gains */
-void buck_toc_start_late(void); /* the first update's guard missed: the normal words back, a LATE reject */
 void buck_toc_ret(void);        /* after the second update: the return words, the period's own A0 result read
                                    (BUCK_TOC_CALL_CORE: no floating-point register, make check rule 5d) */
 

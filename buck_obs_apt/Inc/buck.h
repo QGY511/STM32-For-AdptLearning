@@ -117,6 +117,12 @@ typedef struct {
      * the master's PER and counter, ADC1 CR (ADSTART 0x4) and ISR, ADC2 ISR */
     uint32_t fatal_lr, fatal_prev, fatal_ta_per, fatal_ta_cnt, fatal_mper, fatal_mcnt;
     uint32_t fatal_adc1_cr, fatal_adc1_isr, fatal_adc2_isr;
+    /* The samples' arrival in the passes the TOC code runs after a frame (31 Oct diagnostics; index 0 is T, 1 the
+     * restart pass, then the learning and the extra passes; pr_n of them): the Timer A counter when the wait began,
+     * when ADC2's result was first seen during it (0xFFFF: already there at the start), when ADC1's came, and
+     * ADC12_COMMON->CSR then (OVR_MST 0x10, OVR_SLV 0x100000, EOC_SLV 0x40000) */
+    uint32_t pr_n;
+    uint32_t pr_c0[6], pr_c2[6], pr_c1[6], pr_st[6];
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.

@@ -58,8 +58,9 @@ BUCK_INLINE uint32_t buck_toc_umin(uint32_t a, uint32_t b) { return (a < b) ? a 
 
 /* One order (a constant in each of the two copies: nothing order-dependent is decided at run time).
  * Sets m->req: FRAME, or FAIL (the second update's or the return words' guard missed: buck_toc_finish()
- * trips fault 9); it stays NONE for a LATE reject (the forced span ended at once). */
-BUCK_INLINE void buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck_toc_mb_t *m, float v, float im)
+ * trips fault 9); returns 1 then. Returns 2 for a LATE reject (the first update's guard missed: the forced
+ * span ended at once, the normal words back), with m->req NONE: the pass ends without buck_toc_finish(). */
+BUCK_INLINE uint32_t buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck_toc_mb_t *m, float v, float im)
 {
     const uint32_t on_off = (order == BUCK_TOC_ON_OFF);
     /* the first span's limit: the peak (ON) / valley (OFF) current from i0, and the span maximum (here,
@@ -205,7 +206,7 @@ BUCK_INLINE void buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck
         f->g1 = m->g1[order]; f->g2 = m->g2[order];     /* g1, g2 again: kept across the call they cost a
                                                            spill inside the first span's solve */
     }
-    return;
+    return 1U;
 missed_start:
     /* the first update would come too late (the span's end or the backstop first; nothing transferred):
      * the forced span ends now (ON-OFF; OFF-ON's high side stays off until the next period, as normal), and
@@ -221,26 +222,30 @@ missed_start:
     hr->sTimerxRegs[0].PERxR = BUCK_HRTIM_PERIOD;
     hr->sMasterRegs.MPER = BUCK_HRTIM_PERIOD;
     hr->sCommonRegs.CR2 = BUCK_TOC_SWU;
-    BUCK_TOC_CALL(buck_toc_start_late);         /* the count (and the same words again, harmless) */
-    return;
+    ++g_buck.toc.rej[BUCK_TOCR_LATE];
+    return 2U;
 missed_frame:
     m->f.fail_cnt = cnt;
     m->req = BUCK_TOC_REQ_FAIL;
+    return 1U;
 }
 
-/* The start: v, im, vref of the pass (also into the mailbox for buck_toc_finish). */
-BUCK_INLINE void buck_toc_start_inline(buck_t *b, HRTIM_TypeDef *const hr, float v, float im, float vref)
+/* The start: v, im, vref of the pass (also into the mailbox for buck_toc_finish). Returns 0 for a reject before
+ * anything was forced (the constants are for another V_ref, or the edge came after BUCK_TOC_START_LAST): the
+ * pass goes on as an ordinary one; 1: a frame (or a failed one): buck_toc_finish() through PASS_TOC; 2: a LATE
+ * reject after the SST: the pass ends at once (31 Oct: through buck_toc_finish() a reject took ~350 clocks
+ * static, ~1.75 periods on the board, and the loop's next pass found both ADCs overrun: fault 4). The
+ * constants for a new V_ref are formed at the run's entry only (buck_toc_prime): after a change of V_ref
+ * during a run the TOC rejects (rej[K]) until the next RUN. */
+BUCK_INLINE uint32_t buck_toc_start_inline(buck_t *b, HRTIM_TypeDef *const hr, float v, float im, float vref)
 {
     buck_toc_mb_t *const m = &g_toc_mb;
     m->v = v; m->im = im; m->vref = vref;
     m->req = BUCK_TOC_REQ_NONE;
-    if (__builtin_expect(buck_f2u(m->k.vref) != buck_f2u(vref), 0)) {   /* a new V_ref: finish forms them */
-        ++b->toc.rej[BUCK_TOCR_K];
-        return;
-    }
-    if (__builtin_expect(hr->sTimerxRegs[0].CNTxR > BUCK_TOC_START_LAST, 0)) { ++b->toc.rej[BUCK_TOCR_LATE]; return; }
-    if (v < vref) buck_toc_go(BUCK_TOC_ON_OFF, hr, m, v, im);
-    else          buck_toc_go(BUCK_TOC_OFF_ON, hr, m, v, im);
+    if (__builtin_expect(buck_f2u(m->k.vref) != buck_f2u(vref), 0)) { ++b->toc.rej[BUCK_TOCR_K]; return 0U; }
+    if (__builtin_expect(hr->sTimerxRegs[0].CNTxR > BUCK_TOC_START_LAST, 0)) { ++b->toc.rej[BUCK_TOCR_LATE]; return 0U; }
+    if (v < vref) return buck_toc_go(BUCK_TOC_ON_OFF, hr, m, v, im);
+    return buck_toc_go(BUCK_TOC_OFF_ON, hr, m, v, im);
 }
 
 #endif

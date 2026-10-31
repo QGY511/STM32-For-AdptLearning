@@ -684,7 +684,8 @@ static inline __attribute__((always_inline)) uint32_t run_pass(buck_t *b, run_ct
         if (g_toc_mb.trig != 0U) {
             const float v = (float)adc_v * kq.vsum;                         /* buck_adc_to_v */
             if (UNLIKELY(buck_trigger_score_ko(v - c->s.vref, c->sk, 0) >= c->t.s_th)) {
-                buck_toc_start_inline(b, hrtim, v, buck_adc_to_i_o(&c->t, adc_i4, 0), c->s.vref);
+                ++b->toc.edges;
+                const uint32_t tr = buck_toc_start_inline(b, hrtim, v, buck_adc_to_i_o(&c->t, adc_i4, 0), c->s.vref);
                 /* v_out and the measured average back from the mailbox (the start stored them: held in
                  * registers across it they cost spills inside the first span's solve), opaque: not the
                  * ordinary pass's expressions (GCC would hoist the step in front of the branch, onto the
@@ -698,6 +699,18 @@ static inline __attribute__((always_inline)) uint32_t run_pass(buck_t *b, run_ct
                 uintptr_t ahb2_gpio = AHB2PERIPH_BASE;
                 __asm__ volatile("" : "+r"(ahb2_gpio));
                 ((GPIO_TypeDef *)(ahb2_gpio + (GPIOB_BASE - AHB2PERIPH_BASE)))->BSRR = d4;
+                if (tr != 1U) {
+                    /* a reject (31 Oct): before the SST (rej[K], rej[LATE]) or after it (the first update's guard
+                     * missed, rej[LATE]). The pass ends here without its PIs (the next period keeps its CMP1),
+                     * the TOC's bookkeeping inline: through PASS_TOC and buck_toc_finish() a reject took ~350
+                     * clocks static, ~1.75 periods on the board, and the next pass found both ADCs overrun
+                     * (fault 4). Not an ordinary pass from here: that join costs ~6 clocks in the first span's
+                     * solve (register pressure) */
+                    g_toc_mb.trig = 0U;
+                    g_toc_mb.v_prev = vo;
+                    ++c->loops;
+                    return PASS_NORMAL;
+                }
                 return PASS_TOC;
             }
         }

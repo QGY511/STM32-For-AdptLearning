@@ -61,6 +61,7 @@
  * runs records its samples' arrival (g_buck.toc.pr_*). */
 #define BUCK_TOC_PROBE_PASSES   2U
 #define BUCK_TOC_PROBES         6U
+#define BUCK_TOC_EVENTS         32U     /* g_buck.toc.ev */
 
 enum { BUCK_TOC_RET_STATE = 0U, BUCK_TOC_RET_EXIT = 1U };
 enum { BUCK_TOC_REQ_NONE = 0U, BUCK_TOC_REQ_FRAME = 1U, BUCK_TOC_REQ_FAIL = 2U };
@@ -85,6 +86,8 @@ typedef struct {
                                    ADC1 code (buck_toc_ret has no floating point: BUCK_TOC_CALL_CORE) */
     buck_toc_sol_t sol;
     float g1, g2;               /* the gains of the spans (in use for this frame) */
+    int32_t align;              /* (Timer A - master) counter inside the frame (buck_toc_ret): T's check's reference
+                                   (31 Oct: taken in buck_toc_finish, it came after the frame's end on the board) */
 } buck_toc_frame_t;
 
 typedef struct {

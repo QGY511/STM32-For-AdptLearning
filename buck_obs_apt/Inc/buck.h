@@ -123,6 +123,14 @@ typedef struct {
      * ADC12_COMMON->CSR then (OVR_MST 0x10, OVR_SLV 0x100000, EOC_SLV 0x40000) */
     uint32_t pr_n;
     uint32_t pr_c0[6], pr_c2[6], pr_c1[6], pr_st[6];
+    /* The event log of the last frame (31 Oct diagnostics; README "Enabling" 8, tools/decode_events.py): from the
+     * return words' guard (inside the frame) through the passes the TOC code runs, ev_n entries, each
+     * code << 23 | (CPU cycles since the guard, 12 bits) << 11 | Timer A counter / 32. code: 0x01 ADC1's result
+     * there, 0x02 ADC2's, 0x20 ADC1 overrun, 0x40 ADC2 overrun (the state); 0x04 Timer A CMP3 (the second A0
+     * trigger), 0x08 CMP4 (the first), 0x10 Timer A roll-over, 0x80 the master's (seen since the last entry);
+     * 0x100 a wait began. ev_cyc0: CYCCNT at the guard */
+    uint32_t ev_n, ev_cyc0;
+    uint32_t ev[32];
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.

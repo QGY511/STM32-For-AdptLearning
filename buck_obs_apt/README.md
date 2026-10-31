@@ -154,6 +154,17 @@ TOC rejects (`rej[1]`) until the next RUN. In two runs with a frame the fault ca
 passes after each frame (`BUCK_TOC_PROBE_PASSES`), so that it hands back where the loop waits for its sample, and
 its waits record the samples' arrival (`toc.pr_*`, below).
 
+**31 Oct, on the board: the samples after a frame come at the wrong times.** With the probes, two runs (one with
+bulb sampling, one built with `BUCK_ADC_BULB=0`: not the cause) tripped fault 4 in the restart pass: ADC2 overrun
+without a result (ADC2's next group ended after T's status read but before T's data reads, so T's read cleared its
+EOC and left the overrun). T's wait began late in a period and ADC1's results came at Timer A counts no A0 trigger
+explains (96 and 7328 ticks; 832 and 8160 in the other run; ~1150 in a normal period): either ADC1 converts on
+more or fewer triggers than the A0 compares after a frame, or Timer A's periods after the frame are not 8960. The
+TOC code now keeps an event log from the return words' guard on (`toc.ev`, below): Timer A's CMP3/CMP4 (the A0
+triggers) and roll-overs, the master's roll-overs and the ADC results, in CPU cycles. T's alignment check
+(`chk_align`) takes its reference inside the frame (`buck_toc_ret`); it took it in `buck_toc_finish`, which on the
+board runs after the frame's end, so that it could not see a change of the master's phase across the end.
+
 **31 Oct: the frame's end was too early for the return words.** Until 31 Oct PER' had to be only the A0 lead + one
 guard (3482 ticks, ~93 clocks) after c2, but from c2 to the return words' guard read were ~158 clocks static (the
 second update, the record stores, BUCK_TOC_CALL's FP save, the held duty inside `buck_toc_ret`), and the second
@@ -281,6 +292,13 @@ Enabling (Live Expressions, after RUN)
    restart pass, then the learning and the two extra passes): `pr_c0[k]` the Timer A counter when the wait began,
    `pr_c2[k]` when ADC2's result was first seen (0xFFFF: already there), `pr_c1[k]` when ADC1's came, `pr_st[k]`
    ADC12_COMMON->CSR then (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2's result there).
+8. The event log of the last frame (31 Oct diagnostics): `toc.ev_n` entries of `toc.ev[k]`, from the return words'
+   guard (`toc.c_ret`, inside the frame) through the waits of the passes the TOC code runs. Each is
+   code << 23 | (CPU cycles since that guard, 12 bits) << 11 | Timer A counter / 32; code 0x100 a wait began,
+   0x08 Timer A CMP4 (the first A0 trigger), 0x04 CMP3 (the second), 0x10 Timer A's roll-over, 0x80 the master's
+   (seen since the entry before), 0x01 ADC1's result there, 0x02 ADC2's, 0x20 / 0x40 their overruns.
+   `python3 tools/decode_events.py --cret <c_ret> <ev[0]> <ev[1]> ...` prints it as a timeline (280 cycles per
+   period).
 `tools/live_expressions.txt` has the rows.
 
 HRTIM configuration (all builds)
@@ -330,7 +348,9 @@ update, the record after them), `Src/buck_toc.c` (`buck_toc_ret` without floatin
 `v_mid_code`), `Inc/buck_toc.h` (`BUCK_TOC_SAT_TAIL`), `Inc/buck_config.h` (`SWU2_PATH`, `RET_PATH`,
 `END_LEAD`, `TAIL_LEAD`, `PER0_REL` 320 -> 336 clocks), `tools/check_loop.py` (rule 3: the tail compare;
 rule 5d: the core-only call, its place, no FP in `buck_toc_ret`, the tail), `Tests/test_toc.c` (the frame's
-minimum and the tail as the firmware has them, the 1 A step).
+minimum and the tail as the firmware has them, the 1 A step). Later on 31 Oct: the event log (`Src/buck_toc.c`
+`toc_ev`, `toc_ret_tail`; `Inc/buck.h` `ev`; `tools/decode_events.py`) and the alignment reference inside the
+frame (`Inc/buck_toc_fw.h` `align`).
 
 ---------------------------------------------------------------------------------------------
 

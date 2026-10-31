@@ -73,6 +73,40 @@ static TOC_COLD void toc_fail(buck_t *b, uint32_t code, uint32_t cnt)
     b->toc.state = BUCK_TOCS_IDLE;
 }
 
+/* ---- the event log of the last frame (31 Oct diagnostics: g_buck.toc.ev, README "Enabling" 8): the A0
+ * triggers, the roll-overs and the ADC results in CPU cycles, from the return words' guard on. Integer only
+ * (buck_toc_ret logs: BUCK_TOC_CALL_CORE) */
+_Static_assert(sizeof(g_buck.toc.ev) / sizeof(g_buck.toc.ev[0]) == BUCK_TOC_EVENTS, "event log size");
+#define EV_MREP   0x080U
+#define EV_START  0x100U
+
+/* Timer A's CMP3 (0x04), CMP4 (0x08) and roll-over (0x10) flags (TIMxISR's own bits) and the master's roll-over
+ * (0x80) since the last look, cleared (no interrupt uses them; T's check reads UPD / MUPD, not touched here). */
+static inline uint32_t toc_ev_flags(void)
+{
+    const uint32_t ti = TA.TIMxISR & (HRTIM_TIMISR_CMP3 | HRTIM_TIMISR_CMP4 | HRTIM_TIMISR_REP);
+    const uint32_t mi = HM.MISR & HRTIM_MISR_MREP;
+    if (ti) TA.TIMxICR = ti;
+    if (mi) HM.MICR = HRTIM_MICR_MREP;
+    return ti | (mi ? EV_MREP : 0U);
+}
+
+/* ADC12_COMMON->CSR as the log's state: ADC1's result 0x01, ADC2's 0x02, ADC1 overrun 0x20, ADC2 overrun 0x40 */
+static inline uint32_t toc_ev_state(uint32_t st)
+{
+    return ((st >> 2) & 0x01U) | ((st >> 17) & 0x02U) | ((st << 1) & 0x20U) | ((st >> 14) & 0x40U);
+}
+
+static TOC_CODE void toc_ev(uint32_t code)
+{
+    buck_toc_t *const T = &g_buck.toc;
+    const uint32_t k = T->ev_n;
+    if (k < BUCK_TOC_EVENTS) {
+        T->ev[k] = (code << 23) | (((DWT->CYCCNT - T->ev_cyc0) & 0xFFFU) << 11) | ((TA.CNTxR >> 5) & 0x7FFU);
+        T->ev_n = k + 1U;
+    }
+}
+
 /* Waits for ADC1's end of conversion: the loop's 840 not-ready reads, then fault 4 for good as
  * wait_sample() (Src/buck.c). A frame is at most ~11 us (~1900 clocks): within the timeout. */
 static TOC_CODE uint32_t toc_wait(void)
@@ -81,6 +115,8 @@ static TOC_CODE uint32_t toc_wait(void)
     const uint32_t c0 = TA.CNTxR;               /* diagnostics (31 Oct): the samples' arrival, g_buck.toc.pr_* */
     uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD, st = ADC12_COMMON->CSR;
     uint32_t c2 = (st & ADC_CSR_EOC_SLV) ? 0xFFFFU : 0U;
+    uint32_t s = toc_ev_state(st);
+    toc_ev(EV_START | s | toc_ev_flags());
     while ((st & ADC_CSR_EOC_MST) == 0U) {
         if (c2 == 0U && (st & ADC_CSR_EOC_SLV)) c2 = TA.CNTxR;
         if (--n == 0U) {
@@ -88,6 +124,8 @@ static TOC_CODE uint32_t toc_wait(void)
             buck_fatal(BUCK_FAULT_ADC);
         }
         st = ADC12_COMMON->CSR;
+        const uint32_t fl = toc_ev_flags(), s1 = toc_ev_state(st);
+        if (fl | (s1 ^ s)) { toc_ev(fl | s1); s = s1; }
     }
     const uint32_t k = T->pr_n;
     if (k < BUCK_TOC_PROBES) {
@@ -168,6 +206,31 @@ late:
     return 1U;
 }
 
+/* buck_toc_ret() after its guard (off the return words' path: its own registers, 31 Oct): the alignment reference
+ * for T's check, the event log's start (its flags so far cleared), then the period's own A0 pair (its EOC ~1400
+ * ticks after its second trigger), read and dropped. Integer only (BUCK_TOC_CALL_CORE). */
+static TOC_CODE void toc_ret_tail(buck_toc_frame_t *f)
+{
+    buck_toc_t *const T = &g_buck.toc;
+    f->align = toc_align();
+    T->ev_cyc0 = DWT->CYCCNT;
+    T->ev_n = 0U;
+    (void)toc_ev_flags();
+    uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD;
+    uint32_t st = ADC12_COMMON->CSR, s = toc_ev_state(st);
+    toc_ev(EV_START | s);
+    while ((st & ADC_CSR_EOC_MST) == 0U) {
+        if (--n == 0U) {
+            T->f4_site = 5U; T->f4_csr = st; T->f4_cnt = TA.CNTxR;
+            buck_fatal(BUCK_FAULT_ADC);
+        }
+        st = ADC12_COMMON->CSR;
+        const uint32_t fl = toc_ev_flags(), s1 = toc_ev_state(st);
+        if (fl | (s1 ^ s)) { toc_ev(fl | s1); s = s1; }
+    }
+    f->v_mid_code = ADC1->DR;
+}
+
 /* ---- after the start -------------------------------------------------------------------------- */
 /* Right after the second update (Inc/buck_toc_start.h, through BUCK_TOC_CALL_CORE: no floating point here):
  * the return words for the first normal period P1 into the preloads (they transfer at PER'): the held duty,
@@ -196,18 +259,7 @@ TOC_CODE void buck_toc_ret(void)
         TOC_GUARD(mper, &HM.MPER, early, end, cnt, late);
     }
     f->c_ret = cnt;                             /* board timing (31 Oct) */
-    {
-        /* the period's own A0 pair (its EOC ~1400 ticks after its second trigger) */
-        uint32_t n = 3U * BUCK_CYCLES_PER_PERIOD;
-        uint32_t st;
-        while (((st = ADC12_COMMON->CSR) & ADC_CSR_EOC_MST) == 0U) {
-            if (--n == 0U) {
-                g_buck.toc.f4_site = 5U; g_buck.toc.f4_csr = st; g_buck.toc.f4_cnt = TA.CNTxR;
-                buck_fatal(BUCK_FAULT_ADC);
-            }
-        }
-        f->v_mid_code = ADC1->DR;
-    }
+    toc_ret_tail(f);
     return;
 late:
     f->fail_cnt = cnt;
@@ -240,7 +292,7 @@ TOC_CODE void buck_toc_finish(void)
         T->pr_n = 0U;
         if (!f->ok) ++T->rej[BUCK_TOCR_NONE];
         T->state = BUCK_TOCS_FRAME;
-        T->align_ref = toc_align();
+        T->align_ref = f->align;                /* buck_toc_ret's, inside the frame */
     }
     /* the pass that started it (its observer step, A2 and D4 are its own, Src/buck.c run_pass) */
     m->loops += 1U;

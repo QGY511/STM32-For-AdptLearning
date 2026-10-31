@@ -95,9 +95,10 @@ typedef struct {
     uint32_t f4_site;           /* 0: none, or the loop's own sample timeout (buck_fatal from a pass or the arming
                                    wait: the CPU then spins in buck_fatal); 1 a pass of the loop: a bad sample
                                    (run_exit); 2 T, the frame-end sample, bad; 3 a pass the TOC code runs (the
-                                   restart pass, a learning pass) bad; 4 the TOC code's sample timeout
-                                   (toc_wait); 5 the period's own A0 result not converted inside the frame
-                                   (buck_toc_ret's wait) */
+                                   restart pass, a learning pass) bad, 0x1 in f4_bad: still late after
+                                   BUCK_TOC_DROP_MAX drops; 4 the TOC code's sample timeout (toc_wait); 5 the
+                                   period's own A0 result not converted inside the frame (buck_toc_ret's wait);
+                                   (31 Oct: T no longer faults on its sample, site 2 is a STOP there) */
     uint32_t f4_bad;            /* sites 1-3, the check's bad bits: 0x10 ADC1 overrun, 0x100000 ADC2 overrun,
                                    0x40000 ADC2 without a result (ADC12_COMMON->CSR OVR_MST, OVR_SLV, EOC_SLV
                                    missing) */
@@ -125,12 +126,15 @@ typedef struct {
     uint32_t pr_c0[6], pr_c2[6], pr_c1[6], pr_st[6];
     /* The event log of the last frame (31 Oct diagnostics; README "Enabling" 8, tools/decode_events.py): from the
      * return words' guard (inside the frame) through the passes the TOC code runs, ev_n entries, each
-     * code << 23 | (CPU cycles since the guard, 12 bits) << 11 | Timer A counter / 32. code: 0x01 ADC1's result
-     * there, 0x02 ADC2's, 0x20 ADC1 overrun, 0x40 ADC2 overrun (the state); 0x04 Timer A CMP3 (the second A0
-     * trigger), 0x08 CMP4 (the first), 0x10 Timer A roll-over, 0x80 the master's (seen since the last entry);
-     * 0x100 a wait began. ev_cyc0: CYCCNT at the guard */
+     * code << 23 | (CPU cycles since the guard, 12 bits) << 11 | Timer A counter / 32. code: 0x100 a wait began,
+     * 0x80 a sample dropped (too late for its pass, or incomplete), 0x10 T's CMP1 write skipped (late), 0x08 T's
+     * sample overwritten; with the ADC state there: 0x01 ADC1's result, 0x02 ADC2's, 0x20 / 0x40 their overruns.
+     * ev_cyc0: CYCCNT at the guard */
     uint32_t ev_n, ev_cyc0;
     uint32_t ev[32];
+    /* After frames (31 Oct; cumulative): samples the TOC code's passes dropped (BUCK_TOC_PASS_LAST), T's CMP1
+     * writes skipped (outside their window), T's samples overwritten (no learning from those frames) */
+    uint32_t drop_n, t_skip, t_lost;
 } buck_toc_t;
 
 /* Everything the 600 kHz control loop touches is in this one object.

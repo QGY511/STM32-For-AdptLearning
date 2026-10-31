@@ -154,16 +154,28 @@ TOC rejects (`rej[1]`) until the next RUN. In two runs with a frame the fault ca
 passes after each frame (`BUCK_TOC_PROBE_PASSES`), so that it hands back where the loop waits for its sample, and
 its waits record the samples' arrival (`toc.pr_*`, below).
 
-**31 Oct, on the board: the samples after a frame come at the wrong times.** With the probes, two runs (one with
-bulb sampling, one built with `BUCK_ADC_BULB=0`: not the cause) tripped fault 4 in the restart pass: ADC2 overrun
-without a result (ADC2's next group ended after T's status read but before T's data reads, so T's read cleared its
-EOC and left the overrun). T's wait began late in a period and ADC1's results came at Timer A counts no A0 trigger
-explains (96 and 7328 ticks; 832 and 8160 in the other run; ~1150 in a normal period): either ADC1 converts on
-more or fewer triggers than the A0 compares after a frame, or Timer A's periods after the frame are not 8960. The
-TOC code now keeps an event log from the return words' guard on (`toc.ev`, below): Timer A's CMP3/CMP4 (the A0
-triggers) and roll-overs, the master's roll-overs and the ADC results, in CPU cycles. T's alignment check
-(`chk_align`) takes its reference inside the frame (`buck_toc_ret`); it took it in `buck_toc_finish`, which on the
-board runs after the frame's end, so that it could not see a change of the master's phase across the end.
+**31 Oct, on the board: the TOC code falls up to a period behind its samples after a frame.** Two runs with the
+probes (one with bulb sampling, one built with `BUCK_ADC_BULB=0`) tripped fault 4 in the restart pass: ADC2
+overrun without a result. A third, with an event log of the HRTIM's A0 compares and roll-overs and the ADC results
+in CPU cycles, showed the hardware as designed: the period's own pair converted inside the frame, the frame-end
+pair's compares fired once each, both timers rolled over together at PER' (the alignment check, now referenced
+inside the frame, passed) and T's sample was there ~1150 ticks into P1. The code was late, not the samples: from
+the return words to T's wait ~390 clocks on the board, so after a short frame T began its wait late in P1
+(8064 ticks in one run: its sample was waiting; the probe's own bookkeeping, ~31 clocks, carried its "arrival"
+reading past the period's end, which read as an early sample until the log), the next ADC2 group (570 ticks into
+P2) ended between T's status read and its data reads (T's read cleared that EOC, the overrun stayed: fault 4 in
+the restart pass), or a CMP1 write landed outside its window (fault 5; the log's own polling made that run's T
+later still). Now:
+- `buck_toc_ret` drops ADC2's group of the frame itself (unused); T reads ADC1 only. An ADC1 overrun at T (T after
+  P1's pair) is cleared and counted (`toc.t_lost`): the newest result goes to the observer, no learning.
+- T's CMP1 write outside its window is skipped (`toc.t_skip`; P1's return words, the held duty, stay until the
+  restart pass's CMP1; after OFF-ON without the tail that is DT shorter for that period) instead of fault 5.
+- Every pass the TOC code runs takes its sample only if its wait returned with the counter in
+  [`BUCK_TOC_F_EARLIEST`, `BUCK_TOC_PASS_LAST`) = [1024, 2688) ticks, both results there and no overrun; otherwise
+  it drops it (`toc.drop_n`; the CMP1 in force stays a period more) and takes the next, at most
+  `BUCK_TOC_DROP_MAX` (3) times, then fault 4 (site 3, `f4_bad` with 0x1). A drop in the restart pass means its
+  sample is not P1's: no learning from that frame either.
+- The event log keeps the waits' starts and the drops (no polling of the HRTIM flags: it slowed every wait).
 
 **31 Oct: the frame's end was too early for the return words.** Until 31 Oct PER' had to be only the A0 lead + one
 guard (3482 ticks, ~93 clocks) after c2, but from c2 to the return words' guard read were ~158 clocks static (the
@@ -275,9 +287,10 @@ Enabling (Live Expressions, after RUN)
    later, 16 with it the OFF-ON tail), `c_start`, `t1_ticks`, `t2_ticks` (with the tail: the ON span applied), `t1_model`, `t2_model`, `z_v`, `z_i` (landing), `i_load`, `e_b`, `b`,
    `i_first`, `g`, `learn_n`, `b_n`, `learn_low`, `learn_late`, `learn_skip`, `chk_commit`, `chk_align`. A fault 9 (`BUCK_FAULT_TOC`) means a frame write window or a hardware check failed.
 4. A fault 4 (`BUCK_FAULT_ADC`, 31 Oct diagnostics): `toc.f4_site` says where (0 the loop's own sample timeout, the
-   CPU then spins in `buck_fatal`; 1 a pass of the loop, bad sample; 2 T, the frame-end sample, bad; 3 the restart
-   or a learning pass, bad; 4 the TOC code's sample timeout; 5 the period's own A0 result not converted inside the
-   frame), `toc.f4_bad` which check (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2 without a result),
+   CPU then spins in `buck_fatal`; 1 a pass of the loop, bad sample; 2 T (a STOP only since 31 Oct); 3 the restart
+   or a learning pass, no usable sample within `BUCK_TOC_DROP_MAX` drops; 4 the TOC code's sample timeout; 5 the
+   period's own A0 result not converted inside the frame), `toc.f4_bad` which check (0x10 ADC1 overrun, 0x100000
+   ADC2 overrun, 0x40000 ADC2 without a result, 0x1 every sample too late),
    `toc.f4_csr` and `toc.f4_cnt` the ADC status and the Timer A counter there; with `toc.state`, `edges`,
    `frames`, `sat`, `c_start`, `per_ticks` and `adc_miss` (counted for sites 1-3 only).
 5. The frame's timing on the board (Timer A counter, ticks): `toc.c_start` (SST), `c_swu1`, `c2`, `c_swu2`,
@@ -295,10 +308,10 @@ Enabling (Live Expressions, after RUN)
 8. The event log of the last frame (31 Oct diagnostics): `toc.ev_n` entries of `toc.ev[k]`, from the return words'
    guard (`toc.c_ret`, inside the frame) through the waits of the passes the TOC code runs. Each is
    code << 23 | (CPU cycles since that guard, 12 bits) << 11 | Timer A counter / 32; code 0x100 a wait began,
-   0x08 Timer A CMP4 (the first A0 trigger), 0x04 CMP3 (the second), 0x10 Timer A's roll-over, 0x80 the master's
-   (seen since the entry before), 0x01 ADC1's result there, 0x02 ADC2's, 0x20 / 0x40 their overruns.
+   0x80 a sample dropped, 0x10 T's CMP1 write skipped, 0x08 T's sample overwritten; with the ADC state there: 0x01
+   ADC1's result, 0x02 ADC2's, 0x20 / 0x40 their overruns.
    `python3 tools/decode_events.py --cret <c_ret> <ev[0]> <ev[1]> ...` prints it as a timeline (280 cycles per
-   period).
+   period). Counters over all frames: `toc.drop_n`, `toc.t_skip`, `toc.t_lost`.
 `tools/live_expressions.txt` has the rows.
 
 HRTIM configuration (all builds)
@@ -350,7 +363,9 @@ update, the record after them), `Src/buck_toc.c` (`buck_toc_ret` without floatin
 rule 5d: the core-only call, its place, no FP in `buck_toc_ret`, the tail), `Tests/test_toc.c` (the frame's
 minimum and the tail as the firmware has them, the 1 A step). Later on 31 Oct: the event log (`Src/buck_toc.c`
 `toc_ev`, `toc_ret_tail`; `Inc/buck.h` `ev`; `tools/decode_events.py`) and the alignment reference inside the
-frame (`Inc/buck_toc_fw.h` `align`).
+frame (`Inc/buck_toc_fw.h` `align`); the passes after a frame tolerate being late (`Src/buck_toc.c` `toc_sample`,
+T; `Inc/buck_toc_fw.h` `BUCK_TOC_PASS_LAST`, `BUCK_TOC_DROP_MAX`; `Inc/buck.h` `drop_n`, `t_skip`, `t_lost`;
+`tools/check_loop.py` rule 5c: T's CMP1 guard skips on a miss).
 
 ---------------------------------------------------------------------------------------------
 

@@ -658,14 +658,30 @@ static inline __attribute__((always_inline)) uint32_t run_pass(buck_t *b, run_ct
      * is enabled, and this sample's S >= S_th) in a HOLD pass (not the first pass after arming nor the
      * pass after a tunables pass, both constant here) starts the frame at once, inline, before the PIs
      * (Inc/buck_toc_start.h): the score needs v_out alone, and the frame replaces the period this pass's
-     * CMP1 would be for (the PIs restart after the frame from the measured state). PASS_TOC: the
-     * observer, A2 and D4 of the pass are buck_toc_finish()'s, and loops is counted on by the TOC code.
-     * With the TOC disabled (trig = 0) the pass pays the load of trig and its branch. */
+     * CMP1 would be for (the PIs restart after the frame from the measured state). Then, still in this
+     * pass, its observer step, A2 and D4 (g = 1), as an ordinary pass makes them (31 Oct, user: the step
+     * of the edge's sample in the edge pass itself), after the frame's words (the return words are in:
+     * nothing of the frame waits for it) and on every path of the start (a reject too). PASS_TOC: loops
+     * is counted on by the TOC code. With the TOC disabled (trig = 0) the pass pays the load of trig and
+     * its branch. */
     if (ramp_mode == BUCK_RAMP_HOLD && first == NULL && epoch == 0U) {
         if (g_toc_mb.trig != 0U) {
             const float v = (float)adc_v * kq.vsum;                         /* buck_adc_to_v */
             if (UNLIKELY(buck_trigger_score_ko(v - c->s.vref, c->sk, 0) >= c->t.s_th)) {
                 buck_toc_start_inline(b, hrtim, v, buck_adc_to_i_o(&c->t, adc_i4, 0), c->s.vref);
+                /* v_out and the measured average back from the mailbox (the start stored them: held in
+                 * registers across it they cost spills inside the first span's solve), opaque: not the
+                 * ordinary pass's expressions (GCC would hoist the step in front of the branch, onto the
+                 * path of the ordinary pass's CMP1 write) */
+                float vo = g_toc_mb.v, im = g_toc_mb.im;
+                __asm__("" : "+t"(vo), "+t"(im));
+                IO_WR(ahb2, DAC1_BASE - ADC1_BASE + offsetof(DAC_TypeDef, DHR12R1),
+                      buck_iload_dac_k(buck_obs_step_ao(&c->obs, vo, im, c->ok, c->q.obs_a, 0), c->q.dac_k));
+                uint32_t d4 = D4_PIN;
+                __asm__("" : "+r"(d4));
+                uintptr_t ahb2_gpio = AHB2PERIPH_BASE;
+                __asm__ volatile("" : "+r"(ahb2_gpio));
+                ((GPIO_TypeDef *)(ahb2_gpio + (GPIOB_BASE - AHB2PERIPH_BASE)))->BSRR = d4;
                 return PASS_TOC;
             }
         }
@@ -996,9 +1012,9 @@ static RUN_CODE void run_loop(buck_t *b)
             r = run_pass(b, &c, BUCK_RAMP_##M, NULL, 1U);                       \
             if (r == PASS_EXIT) return;                                         \
         } while (c.mode == BUCK_RAMP_##M)
-        /* PASS_TOC (HOLD copy only, stage 4; the frame has started in the pass): the state into the mailbox
-         * and the rest (buck_toc_finish: the return words, the pass's observer, A2 and D4 and, with a frame,
-         * its two samples); then on in the same copy with the state taken back. */
+        /* PASS_TOC (HOLD copy only, stage 4; the frame has started in the pass, its return words and the
+         * pass's observer step are in): the state into the mailbox and the rest (buck_toc_finish: with a
+         * frame, its samples after it); then on in the same copy with the state taken back. */
 #define RUN_TOC()                                                               \
         do {                                                                    \
             g_toc_mb.s = c.s; g_toc_mb.obs = c.obs; g_toc_mb.ok = c.ok;         \

@@ -296,6 +296,10 @@ static void plan_normal(span_plan_t *sp, uint32_t cmp, int hs_at_start)
  * lies at least BUCK_TOC_SWU_GUARD_TICKS beyond that). */
 #define SIM_C_S_TICKS     3350U
 #define SIM_SOLVE_TICKS   1984U
+/* ... and the counter read after the second update's wait this many ticks after the SST (the held duty is
+ * formed before the wait: 88 + 90-96 + 3 clocks static, so the wait does not wait), or at
+ * BUCK_TOC_SWU2_FIRST if later; the frame's end at least BUCK_TOC_END_LEAD_TICKS after that read */
+#define SIM_WAIT_TICKS    (32U * 184U)
 
 typedef struct {
     double t_up, t_down, t_end, i_base_R, i_step, L_plant, rl_plant;
@@ -316,6 +320,7 @@ typedef struct {
     float b[2];
     double dip_last, hump_last;                         /* of the last cycle */
     long learn_low;
+    long per_sat;                                       /* frames whose end is the minimum (SAT_PER) */
 } tres_t;
 
 static void run_loop_sim(const tscen_t *sc, tres_t *res)
@@ -345,7 +350,7 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
     float v_prev = 0.0f;
     /* the episode: 0 none, 1 = the next pass reads the frame's end (T), 2 = it reads after P1 (1) */
     int ep = 0;
-    uint32_t ep_order = 0, ep_sat = 0, ep_ok = 0, ep_t1 = 0, ep_t2 = 0, hold_cmp = 0;
+    uint32_t ep_order = 0, ep_tail = 0, ep_sat = 0, ep_ok = 0, ep_t1 = 0, ep_t2 = 0, hold_cmp = 0;
     float ep_a = 0, ep_dhold = 0, ep_g1 = 1, ep_g2 = 1, v_end = 0, ep_ieq = 0;
     double t = 0.0;
     const double period2 = 2.0 * (sc->t_down - sc->t_up);
@@ -447,8 +452,19 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
                 if (t2 < lo) { t2 = lo; sat |= BUCK_TOC_SAT_LIMIT2; }
                 if (t2 > hi) { t2 = hi; sat |= BUCK_TOC_SAT_LIMIT2; }
                 uint32_t per = on_off ? cmp2 + t2 - BUCK_DT_TICKS : cmp2 + BUCK_DT_TICKS + t2;
-                const uint32_t plo = BUCK_TOC_SWU2_FIRST + BUCK_TOC_A0_LEAD_TICKS + BUCK_TOC_SWU_GUARD_TICKS;
-                if (per < plo) { per = plo; sat |= BUCK_TOC_SAT_PER; }
+                const uint32_t c2 = (c_s + SIM_WAIT_TICKS > BUCK_TOC_SWU2_FIRST) ? c_s + SIM_WAIT_TICKS : BUCK_TOC_SWU2_FIRST;
+                const uint32_t plo = (c2 + BUCK_TOC_END_LEAD_TICKS > BUCK_TOC_PER_MIN_TICKS) ? c2 + BUCK_TOC_END_LEAD_TICKS
+                                                                                            : BUCK_TOC_PER_MIN_TICKS;
+                uint32_t t_end = 0U;            /* OFF-ON stretched: the ON span's end (Timer A CMP1), else 0 */
+                if (per < plo) {
+                    per = plo; sat |= BUCK_TOC_SAT_PER;
+                    if (!on_off) {
+                        t_end = cmp2 + BUCK_DT_TICKS + t2;
+                        if (t_end < c2 + BUCK_TOC_TAIL_LEAD_TICKS) t_end = c2 + BUCK_TOC_TAIL_LEAD_TICKS;
+                        t2 = t_end - cmp2 - BUCK_DT_TICKS;
+                        sat |= BUCK_TOC_SAT_TAIL;
+                    }
+                }
                 /* the frame: the period's own on-time, then the first span from c_s, the second, the end */
                 sp.ne = 0;
                 sp.e[sp.ne++] = (edge_t){ 0, hs_at_start ? 1 : -1 };
@@ -463,6 +479,10 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
                     if (cmp_active >= c_s) { sp.e[sp.ne++] = (edge_t){ c_s, -1 }; sp.e[sp.ne++] = (edge_t){ c_s + BUCK_DT_TICKS, 0 }; }
                     sp.e[sp.ne++] = (edge_t){ cmp2, -1 };
                     sp.e[sp.ne++] = (edge_t){ cmp2 + BUCK_DT_TICKS, 1 };
+                    if (t_end) {                /* the tail: low side on to the frame's end */
+                        sp.e[sp.ne++] = (edge_t){ t_end, -1 };
+                        sp.e[sp.ne++] = (edge_t){ t_end + BUCK_DT_TICKS, 0 };
+                    }
                 }
                 for (int j = 0; j < 4; ++j) sp.ti[j] = BUCK_ISAMPLE_CMP((uint32_t)j);
                 sp.tv[0] = per - BUCK_TOC_A0_LEAD_TICKS; sp.tv[1] = per - BUCK_VSAMPLE_LEAD_TICKS;   /* the frame's end pair */
@@ -470,7 +490,8 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
                 frame = 1;
                 ep_dhold = buck_toc_hold_duty(vref, sol.ieq);
                 hold_cmp = buck_duty_to_cmp(ep_dhold);
-                cmp_next = on_off ? hold_cmp : hold_cmp - BUCK_DT_TICKS;      /* P1 (the return words) */
+                cmp_next = (on_off || t_end) ? hold_cmp : hold_cmp - BUCK_DT_TICKS;      /* P1 (the return words) */
+                ep_tail = t_end != 0U;
                 ep_order = order; ep_sat = sat; ep_ok = (uint32_t)okk; ep_t1 = t1a; ep_t2 = t2; ep_a = sol.a; ep_ieq = sol.ieq;
                 ep_g1 = g1; ep_g2 = g2;
                 (void)buck_obs_step(&obs, v, im, ok);
@@ -479,6 +500,7 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
                 ep = 1;
                 ++res->frames;
                 if (sat & BUCK_TOC_SAT_LATE1) ++res->late;
+                if (sat & BUCK_TOC_SAT_PER) ++res->per_sat;
                 if (!okk) ++res->none;
             } else {
                 buck_step_t stp; buck_out_t o;
@@ -506,7 +528,7 @@ static void run_loop_sim(const tscen_t *sc, tres_t *res)
             if (in_cyc < 0.4e-3) res->dip_last = fmax(res->dip_last, vref - v);
             if (in_cyc >= hi_len && in_cyc < hi_len + 0.4e-3) res->hump_last = fmax(res->hump_last, v - vref);
         }
-        hs_at_start = frame && ep_order == BUCK_TOC_OFF_ON;
+        hs_at_start = frame && ep_order == BUCK_TOC_OFF_ON && !ep_tail;
         cmp_active = cmp_next;
         t += sp.per * BUCK_TICK_S;
         (void)T;
@@ -524,13 +546,16 @@ static void test_closed_loop(void)
         { { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 6 -> 1 A, PI alone", 0, 0, 0 } },
         { { 13e-3, 15e-3, 17e-3, R1, 5.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 6 -> 1 A, TOC", 0, 0, 0 } },
         { { 13e-3, 15e-3, 17e-3, R1, 2.0, BUCK_L_H, BUCK_RL_OHM, 2, 1, 0, 1, "1 -> 3 -> 1 A, TOC, ADC noise +-2", 0, 0, 0 } },
+        { { 13e-3, 15e-3, 17e-3, R1, 1.0, BUCK_L_H, BUCK_RL_OHM, 0, 0, 0, 1, "1 -> 2 -> 1 A, PI alone", 0, 0, 0 } },
+        { { 13e-3, 15e-3, 17e-3, R1, 1.0, BUCK_L_H, BUCK_RL_OHM, 0, 1, 0, 1, "1 -> 2 -> 1 A, TOC", 0, 0, 0 } },
     };
     tres_t r[sizeof sc / sizeof sc[0]];
     for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; ++i) {
         srand(21);
         run_loop_sim(&sc[i].s, &r[i]);
-        printf("[%s] dip %.1f mV, hump %.1f mV; i_L %.2f .. %.2f A; frames %ld (first span late %ld, no pair %ld)\n",
-               sc[i].s.name, r[i].dip * 1e3, r[i].hump * 1e3, r[i].imin, r[i].imax, r[i].frames, r[i].late, r[i].none);
+        printf("[%s] dip %.1f mV, hump %.1f mV; i_L %.2f .. %.2f A; frames %ld (first span late %ld, no pair %ld, "
+               "end at its minimum %ld)\n", sc[i].s.name, r[i].dip * 1e3, r[i].hump * 1e3, r[i].imin, r[i].imax,
+               r[i].frames, r[i].late, r[i].none, r[i].per_sat);
     }
     CHECK(r[0].frames == 0 && r[2].frames == 0, "no frame with the TOC off");
     CHECK(r[1].frames == 2 && r[3].frames == 2, "one frame per step with the TOC on");
@@ -540,6 +565,11 @@ static void test_closed_loop(void)
     CHECK(r[3].dip < 0.6 * r[2].dip && r[3].hump < 0.6 * r[2].hump, "TOC cuts the 5 A dip and hump");
     CHECK(r[1].imax < BUCK_TOC_IPK_MAX_A + 1.0 && r[3].imax < BUCK_TOC_IPK_MAX_A + 1.0, "peak current within the limit");
     CHECK(r[4].frames >= 2 && r[4].dip < 0.7 * r[0].dip, "TOC with ADC noise");
+    /* the 1 A down step's frame ends at its minimum (the valley-limited OFF span is long, the ON span short):
+     * the ON span ends as solved, the rest with the low side on (31 Oct; with the high side on to the moved
+     * end the hump was 248 mV, 3.5 x the PI's) */
+    CHECK(r[6].frames == 2 && r[6].per_sat >= 1, "the 1 A step's OFF-ON frame ends at its minimum");
+    CHECK(r[6].hump < 0.7 * r[5].hump && r[6].dip < 1.05 * r[5].dip, "TOC on the 1 A step: the tail keeps the hump down");
     /* learning over repeated steps: the board-like plant, a mismatched one, a slewing load (the edge comes
      * mid-slew: the edge estimate is short of the final load, b's case), mixed step sizes, ESR */
     const tscen_t lr[] = {
@@ -565,8 +595,12 @@ static void test_closed_loop(void)
         CHECK(q.g[0][0] >= BUCK_TOC_G_MIN && q.g[0][1] >= BUCK_TOC_G_MIN && q.g[1][0] >= BUCK_TOC_G_MIN &&
               q.g[1][1] >= BUCK_TOC_G_MIN && fabsf(q.b[0]) <= BUCK_TOC_B_MAX_A && fabsf(q.b[1]) <= BUCK_TOC_B_MAX_A,
               "%s: gains and b in range", lr[i].name);
+        /* the hump within 10 %: the 2 A down step's OFF-ON frame is valley-limited and (since 31 Oct) ends with
+         * the tail, so it has no free span to learn (z_v stays ~+27 mV, README Known limits); b alone moves,
+         * and its correct I_eq removes a small bias that had covered part of that shortfall (L -20 %: 47.6 ->
+         * 50.6 mV), as with ESR below */
         if (!lr[i].mix && lr[i].esr == 0.0)
-            CHECK(q.dip_last <= q0.dip_last * 1.05 && q.hump_last <= q0.hump_last * 1.05, "%s: learning does not make the "
+            CHECK(q.dip_last <= q0.dip_last * 1.05 && q.hump_last <= q0.hump_last * 1.10, "%s: learning does not make the "
                   "last step worse", lr[i].name);
         /* with ESR the edge cycle's dv carries ESR x the load step, so the unlearned I_eq is ~2 A high and the
          * pulse oversized (which hides the lossless model's charge shortfall); b takes the bias out (its job), the

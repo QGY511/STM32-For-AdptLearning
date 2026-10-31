@@ -38,7 +38,10 @@ enum {                          /* what clamped a frame (g_buck.toc.sat) */
     BUCK_TOC_SAT_LIMIT1 = 1U,   /* first span at its limit (peak / valley current, or the span maximum) */
     BUCK_TOC_SAT_LATE1 = 2U,    /* first span longer than solved: the solve finished after the model's end */
     BUCK_TOC_SAT_LIMIT2 = 4U,   /* second span at its limit (minimum, maximum, the frame's range) */
-    BUCK_TOC_SAT_PER = 8U       /* the frame's end moved later (PER' minimum: master CMP4 + 600, the A0 pair) */
+    BUCK_TOC_SAT_PER = 8U,      /* the frame's end moved later (its minimum: the second update's and the return
+                                   words' path, BUCK_TOC_END_LEAD_TICKS; master CMP4 + 600) */
+    BUCK_TOC_SAT_TAIL = 16U     /* with PER, OFF-ON: the ON span ended as solved (Timer A CMP1, reset source from
+                                   the second update), the rest of the frame with the low side on (31 Oct) */
 };
 
 /* VSQRT on the target (sqrtf would be a library call that sets errno for x < 0). */

@@ -233,6 +233,32 @@ def arming_writes(body, cands):
     return out
 
 
+def toc_tail_writes(body, cands):
+    """Stage 4 (31 Oct): the unguarded stores to [rB, #156] among cands that are the OFF-ON frame's tail
+    compare (Inc/buck_toc_start.h: a frame stretched to its minimum ends its ON span with Timer A CMP1):
+    a register loaded with #8 (HRTIM_RST1R_CMP1) within the 6 instructions before, and followed within
+    three instructions, with no other store between (but to the stack), by a store of that register to
+    [rB, #192] (Timer A RST1R) through the same base. Inside a frame CMP1 is that reset only; the deadline check is the
+    passes'. Rule 5d checks that it is on the way to a guarded software update."""
+    out = []
+    for i in cands:
+        m = re.match(REGN + r', \[' + REGN + r', #156\]$', body[i][2])
+        if not m:
+            continue
+        for k in range(i + 1, min(i + 4, len(body))):
+            op, args = body[k][1], body[k][2]
+            r = re.match(REGN + r', \[' + m.group(2) + r', #192\]$', args)
+            if op.startswith('str') and r:
+                reg = r.group(1)
+                if any(body[j][1].startswith('mov') and body[j][2].replace(' ', '') == f'{reg},#8'
+                       for j in range(max(0, i - 6), i)):
+                    out.append(i)
+                break
+            if op.startswith(('str', 'vstr', 'stm', 'push')) and not re.search(r'\[sp(, #\d+)?\]$', args):
+                break
+    return out
+
+
 def arming_write(body, cands, evp):
     """(index of the arming write or None, None) or (None, reason): the one
     write among cands that arming_writes() finds and that is not on the path
@@ -558,15 +584,19 @@ def defs(op, args):
 
 def toc_call_restore(body, i):
     """Stage 2: True for the ldm that ends a BUCK_TOC_CALL (Inc/buck_toc_fw.h): stmdb sp!, {L};
-    vpush; bl; vpop; ldmia sp!, {L} with the same list: it restores the values the stmdb saved,
-    so it writes nothing new."""
+    vpush; bl; vpop; ldmia sp!, {L} with the same list, or a BUCK_TOC_CALL_CORE (31 Oct): stmdb sp!, {L};
+    bl; ldmia sp!, {L}: it restores the values the stmdb saved, so it writes nothing new."""
     a, op, args = body[i]
-    if not (op.split('.')[0].startswith('ldm') and args.startswith('sp!') and i >= 4):
+    if not (op.split('.')[0].startswith('ldm') and args.startswith('sp!') and i >= 2):
+        return False
+    same = lambda s0: (s0[1].startswith('stmdb') and s0[2].startswith('sp!') and
+                       s0[2][s0[2].find('{'):] == args[args.find('{'):])
+    if same(body[i - 2]) and body[i - 1][1] == 'bl':
+        return True                             # BUCK_TOC_CALL_CORE
+    if i < 4:
         return False
     s0, v0, b0, v1 = body[i - 4], body[i - 3], body[i - 2], body[i - 1]
-    return (s0[1].startswith('stmdb') and s0[2].startswith('sp!') and
-            s0[2][s0[2].find('{'):] == args[args.find('{'):] and v0[1] == 'vpush' and b0[1] == 'bl' and
-            v1[1] == 'vpop' and v0[2] == v1[2])
+    return same(s0) and v0[1] == 'vpush' and b0[1] == 'bl' and v1[1] == 'vpop' and v0[2] == v1[2]
 
 
 def exit_restore(body, i, lo, hi):
@@ -943,6 +973,12 @@ def main():
         errors.append(why)
     elif arm is not None:
         del unguarded[arm]
+    # the OFF-ON frame's tail compare (stage 4, 31 Oct; rule 5d: exactly one, on the way to a guarded software
+    # update). Not tested against every_pass_part: the TOC branch is on the path of an ordinary (HOLD) pass
+    # there (it takes no loops & 31 edge); no pass writes RST1R
+    toc_tails = toc_tail_writes(body, unguarded)
+    for i in toc_tails:
+        del unguarded[i]
     for i, why in sorted(unguarded.items()):
         errors.append(f'CMP1 write at 0x{body[i][0]:08x} is not guarded by the deadline check: {why}')
     if guarded == 0:
@@ -991,7 +1027,11 @@ def main():
     #     (CR2), at least 4 (two per order); in each order the high side is forced (a store to Timer A
     #     SET1R #188 or RST1R #192) BEFORE the solve's square root (the feed-forward: the span runs while
     #     it is solved), and the square root before that order's first update; run_loop calls
-    #     buck_toc_finish (after PASS_TOC) and buck_toc_ret (one per order), each through BUCK_TOC_CALL;
+    #     buck_toc_finish (after PASS_TOC) through BUCK_TOC_CALL and buck_toc_ret (one per order) through
+    #     BUCK_TOC_CALL_CORE (push of the caller-saved core registers, bl: no FP save), so buck_toc_ret
+    #     must use no floating-point register (no s/d operand, no vpush/vpop/vmrs/vmsr), and each such
+    #     call follows a guarded software update within 12 instructions (31 Oct: the return words right
+    #     after the second update, on the path BUCK_TOC_END_LEAD_TICKS budgets);
     #  e. the TOC code calls nothing outside CCM: no bl to a flash function or a linker veneer (a struct
     #     initializer that GCC turns into memset/memcpy would run from flash; buck_fatal excepted).
     TOC_PREFIX = ('toc_', 'buck_toc_')
@@ -1080,6 +1120,28 @@ def main():
               if op.startswith('str') and not op.startswith('strd') and re.search(r'#(188|192)\]$', args)]
     if len(sqrts) != 2:
         errors.append(f'stage 4: {len(sqrts)} square roots in run_loop (2 expected: one solve per order)')
+    # the OFF-ON tail compare (31 Oct): one, and a guarded software update follows it (unconditional
+    # branches followed) within 48 instructions
+    bidx = {a: k for k, (a, _, _) in enumerate(body)}
+    swu_set = set(swu)
+
+    def to_swu(k, steps=48):
+        n_ = 0
+        while k is not None and k < len(body) and n_ < steps:
+            if k in swu_set:
+                return True
+            op, args = body[k][1], body[k][2]
+            if op in ('b', 'b.n', 'b.w'):
+                k = bidx.get(int(args.split()[0], 16))
+            else:
+                k += 1
+            n_ += 1
+        return False
+    if len(toc_tails) != 1:
+        errors.append(f'stage 4: {len(toc_tails)} OFF-ON tail compares (CMP1, then RST1R = CMP1) in run_loop (1 expected)')
+    for i in toc_tails:
+        if not to_swu(i):
+            errors.append(f'stage 4: the tail compare at 0x{body[i][0]:08x} is not followed by a guarded software update')
     for q in sqrts:
         before = [k for k in forced if q - 40 <= k < q]
         after_swu = [k for k in swu if q < k <= q + 60]
@@ -1094,9 +1156,24 @@ def main():
     n_fin = sum(1 for k, t in calls if t in fin)
     n_ret = sum(1 for k, t in calls if t in ret)
     for k, t in calls:
-        if t in fin or t in ret:
+        if t in fin:
             if not (k >= 2 and body[k - 2][1].startswith('stmdb') and body[k - 1][1] == 'vpush'):
                 errors.append(f'stage 4: bl at 0x{body[k][0]:08x} into the TOC code is not a BUCK_TOC_CALL')
+        if t in ret:
+            if not (k >= 1 and body[k - 1][1].startswith(('stmdb', 'push')) and
+                    all(r in body[k - 1][2] for r in ('r0', 'r1', 'r2', 'r3', 'ip', 'lr'))):
+                errors.append(f'stage 4: bl at 0x{body[k][0]:08x} into buck_toc_ret is not a BUCK_TOC_CALL_CORE')
+            if not any(k - 12 <= j < k for j in swu):
+                errors.append(f'stage 4: the call of buck_toc_ret at 0x{body[k][0]:08x} does not follow a software '
+                              f'update within 12 instructions (the return words\' path)')
+    for n_ in ('buck_toc_ret',):
+        if n_ in syms:
+            a0, sz = syms[n_][0] & ~1, syms[n_][1]
+            for a, op, args in allins:
+                if a0 <= a < a0 + sz and (op.startswith(('vpush', 'vpop', 'vmrs', 'vmsr')) or
+                                         re.search(r'\b[sd]\d+\b', args)):
+                    errors.append(f'stage 4: {n_} uses a floating-point register at 0x{a:08x} ({op} {args}): '
+                                  f'BUCK_TOC_CALL_CORE does not save them')
     if n_fin < 1:
         errors.append('stage 4: run_loop does not call buck_toc_finish')
     if n_ret < 2:
@@ -1122,7 +1199,8 @@ def main():
               f'arming wait\'s) and in the passes, obs_beta and obs_gamma not on the path of an ordinary pass ({nloops} loops & 31 tests); '
               f'stage 4: {len(tocfn)} TOC functions in CCM, {toc_guarded} TOC guarded writes ({toc_guarded_fail} CMP1 to '
               f'toc_fail), {n_swu_ok} guarded software updates in the inline start, the high side forced before each '
-              f'of its {len(sqrts)} solves, no call out of CCM)')
+              f'of its {len(sqrts)} solves, {len(toc_tails)} OFF-ON tail compare, the return words right after the second '
+              f'update without FP saves, no call out of CCM)')
     return 1 if errors else 0
 
 

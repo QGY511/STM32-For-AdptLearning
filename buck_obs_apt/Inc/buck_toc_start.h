@@ -124,13 +124,41 @@ BUCK_INLINE void buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck
         if (t2 > hi) { t2 = hi; sat |= BUCK_TOC_SAT_LIMIT2; }
     }
     uint32_t per = on_off ? cmp2 + t2 - BUCK_DT_TICKS : cmp2 + BUCK_DT_TICKS + t2;
+    /* the held duty of P1 and P2, for buck_toc_ret() and buck_toc_finish(): here, before the wait, off the
+     * path from the counter read below to the return words (31 Oct) */
+    {
+        buck_toc_frame_t *const f = &m->f;
+        const float d_hold = buck_toc_hold_duty(m->vref, sol.ieq);
+        const uint32_t hold_cmp = buck_duty_to_cmp(d_hold);
+        f->d_hold = d_hold;
+        f->hold_cmp = hold_cmp;
+        f->ret_cmp1 = on_off ? hold_cmp : hold_cmp - BUCK_DT_TICKS;   /* P1 after OFF-ON: no dead time */
+    }
     /* the second update comes after the period's own A0 pair has been triggered (the pair stays: moving
      * its second trigger would split it) */
     while (hr->sTimerxRegs[0].CNTxR < BUCK_TOC_SWU2_FIRST) {}
     {
-        const uint32_t lo = buck_toc_umax(hr->sTimerxRegs[0].CNTxR + BUCK_TOC_A0_LEAD_TICKS + BUCK_TOC_SWU_GUARD_TICKS,
-                                          BUCK_TOC_PER_MIN_TICKS);
-        if (per < lo) { per = lo; sat |= BUCK_TOC_SAT_PER; }
+        /* the frame's end far enough after this read for the second update and the return words
+         * (BUCK_TOC_END_LEAD_TICKS) */
+        const uint32_t c2 = hr->sTimerxRegs[0].CNTxR;
+        const uint32_t lo = buck_toc_umax(c2 + BUCK_TOC_END_LEAD_TICKS, BUCK_TOC_PER_MIN_TICKS);
+        if (__builtin_expect(per < lo, 0)) {
+            per = lo; sat |= on_off ? BUCK_TOC_SAT_PER : BUCK_TOC_SAT_PER | BUCK_TOC_SAT_TAIL;
+            if (!on_off) {
+                /* OFF-ON (31 Oct): the high side would stay on to the moved end (the current up by
+                 * (V_in - V_ref)/L for every tick of it). The ON span ends as solved instead, or as soon
+                 * as this update can make it (BUCK_TOC_TAIL_LEAD_TICKS after the read): Timer A
+                 * CMP1, no source of the frame so far, as the reset. The rest with the low side on, and P1
+                 * as after ON-OFF (its CMP1 with DT). make check rule 3 takes this store for the tail's.
+                 * The ON span applied is the mailbox's (t_end: buck_toc_finish), so that nothing of it
+                 * stays live across the return words' call. */
+                const uint32_t t_end = buck_toc_umax(cmp2 + BUCK_DT_TICKS + t2, c2 + BUCK_TOC_TAIL_LEAD_TICKS);
+                hr->sTimerxRegs[0].CMP1xR = t_end;
+                hr->sTimerxRegs[0].RSTx1R = HRTIM_RST1R_CMP1;
+                m->f.ret_cmp1 = m->f.hold_cmp;
+                m->f.t_end = t_end;
+            }
+        }
         if (per > BUCK_TOC_PER_MAX_TICKS) { per = BUCK_TOC_PER_MAX_TICKS; sat |= BUCK_TOC_SAT_LIMIT2; }
     }
     hr->sTimerxRegs[0].PERxR = per;
@@ -143,14 +171,18 @@ BUCK_INLINE void buck_toc_go(const uint32_t order, HRTIM_TypeDef *const hr, buck
         const uint32_t swu = BUCK_TOC_SWU;
         TOC_GUARDB(hr, swu, &hr->sCommonRegs.CR2, early, win, cnt, missed_frame);
     }
-    /* the record, then the return words (buck_toc_ret: the held duty from it) */
+    /* the return words at once (buck_toc_ret: the held duty above, guarded against PER'), the record after
+     * them (make check rule 5d: the call follows the update) */
+    m->f.per = per;
+    m->req = BUCK_TOC_REQ_FRAME;
+    BUCK_TOC_CALL_CORE(buck_toc_ret);           /* sets req = FAIL if its guard misses */
     {
         buck_toc_frame_t *const f = &m->f;
-        f->order = order; f->sat = sat; f->ok = (uint32_t)ok; f->c_s = c_s; f->per = per; f->t1 = t1a; f->t2 = t2;
-        f->sol = sol; f->g1 = g1; f->g2 = g2;
+        f->order = order; f->sat = sat; f->ok = (uint32_t)ok; f->c_s = c_s; f->t1 = t1a; f->t2 = t2;
+        f->sol = sol;
+        f->g1 = m->g1[order]; f->g2 = m->g2[order];     /* g1, g2 again: kept across the call they cost a
+                                                           spill inside the first span's solve */
     }
-    m->req = BUCK_TOC_REQ_FRAME;
-    BUCK_TOC_CALL(buck_toc_ret);                /* sets req = FAIL if its guard misses */
     return;
 missed_start:
     /* the first update would come too late (the span's end or the backstop first; nothing transferred):

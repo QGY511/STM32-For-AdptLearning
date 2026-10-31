@@ -168,9 +168,11 @@ late:
 }
 
 /* ---- after the start -------------------------------------------------------------------------- */
-/* Right after the third update (Inc/buck_toc_start.h, through BUCK_TOC_CALL): the return words for the
- * first normal period P1 into the preloads (they transfer at PER'): the held duty, the duty that holds
- * I_eq (without DT after OFF-ON: the high side is on across the frame's end); then the period's own A0
+/* Right after the second update (Inc/buck_toc_start.h, through BUCK_TOC_CALL_CORE: no floating point here):
+ * the return words for the first normal period P1 into the preloads (they transfer at PER'): the held duty,
+ * the duty that holds I_eq, formed by the start before its wait (without DT after OFF-ON: the high side is on
+ * across the frame's end; with the OFF-ON tail with DT; the counter read after that wait leaves
+ * BUCK_TOC_END_LEAD_TICKS to PER'); then the period's own A0
  * pair, converted inside the frame, is read and dropped (before the frame's end pair converts: else an
  * overrun). A missed guard sets req = FAIL (buck_toc_finish trips fault 9). */
 TOC_CODE void buck_toc_ret(void)
@@ -178,10 +180,7 @@ TOC_CODE void buck_toc_ret(void)
     buck_toc_mb_t *const m = &g_toc_mb;
     buck_toc_frame_t *const f = &m->f;
     uint32_t cnt;
-    const float d_hold = buck_toc_hold_duty(m->vref, f->sol.ieq);
-    const uint32_t hold_cmp = buck_duty_to_cmp(d_hold);
-    f->d_hold = d_hold;
-    f->hold_cmp = hold_cmp;
+    const uint32_t ret_cmp1 = f->ret_cmp1, end = f->per - BUCK_TOC_RET_GUARD_TICKS;   /* the start's */
     HM.MICR = HRTIM_MICR_MUPD;                  /* the frame's end transfer sets them again (finish, T) */
     TA.TIMxICR = HRTIM_TIMICR_UPDC;
     TA.CMP2xR = BUCK_TOC_CMP2_BACKSTOP;
@@ -189,10 +188,10 @@ TOC_CODE void buck_toc_ret(void)
     TA.CMP4xR = BUCK_VSAMPLE0_CMP;
     TA.SETx1R = HRTIM_SET1R_PER;
     TA.RSTx1R = HRTIM_RST1R_CMP1 | HRTIM_RST1R_CMP2;
-    TA.CMP1xR = (f->order == BUCK_TOC_ON_OFF) ? hold_cmp : hold_cmp - BUCK_DT_TICKS;
+    TA.CMP1xR = ret_cmp1;
     TA.PERxR = BUCK_HRTIM_PERIOD;
     {
-        const uint32_t early = 0U, end = f->per - BUCK_TOC_RET_GUARD_TICKS, mper = BUCK_HRTIM_PERIOD;
+        const uint32_t early = 0U, mper = BUCK_HRTIM_PERIOD;
         TOC_GUARD(mper, &HM.MPER, early, end, cnt, late);
     }
     {
@@ -201,7 +200,7 @@ TOC_CODE void buck_toc_ret(void)
         while ((ADC12_COMMON->CSR & ADC_CSR_EOC_MST) == 0U) {
             if (--n == 0U) buck_fatal(BUCK_FAULT_ADC);
         }
-        f->v_mid = (float)ADC1->DR * VSUM;
+        f->v_mid_code = ADC1->DR;
     }
     return;
 late:
@@ -209,7 +208,8 @@ late:
     m->req = BUCK_TOC_REQ_FAIL;
 }
 
-/* The return words, the rest of the pass that started the frame and, with a frame, its two samples
+/* After the pass that started the frame (its return words and its observer step are in: Src/buck.c,
+ * Inc/buck_toc_start.h): the frame's record, the pass's bookkeeping and, with a frame, its two samples
  * (Inc/buck_toc_fw.h). run_loop has copied its state into the mailbox; it takes s, obs and loops back
  * unless ret = EXIT. */
 TOC_CODE void buck_toc_finish(void)
@@ -225,18 +225,16 @@ TOC_CODE void buck_toc_finish(void)
     const float d_hold = f->d_hold;
     if (m->req == BUCK_TOC_REQ_FAIL) { toc_fail(b, BUCK_FAULT_TOC, f->fail_cnt); return; }
     if (m->req == BUCK_TOC_REQ_FRAME) {
-        T->order = f->order; T->sat = f->sat; T->c_start = f->c_s; T->t1_ticks = f->t1; T->t2_ticks = f->t2;
+        T->order = f->order; T->sat = f->sat; T->c_start = f->c_s; T->t1_ticks = f->t1;
+        /* the second span applied: with the tail (OFF-ON) from the ON span's start, c_s + t1, to its end */
+        T->t2_ticks = (f->sat & BUCK_TOC_SAT_TAIL) ? f->t_end - f->c_s - f->t1 : f->t2;
         T->per_ticks = f->per; T->hold_cmp = hold_cmp; T->v0 = m->v; T->i0 = m->im; T->ieq = f->sol.ieq;
-        T->a = f->sol.a; T->t1_model = f->sol.t1; T->t2_model = f->sol.t2; T->v_mid = f->v_mid;
+        T->a = f->sol.a; T->t1_model = f->sol.t1; T->t2_model = f->sol.t2; T->v_mid = (float)f->v_mid_code * VSUM;
         if (!f->ok) ++T->rej[BUCK_TOCR_NONE];
         T->state = BUCK_TOCS_FRAME;
         T->align_ref = toc_align();
-        toc_gains_take(m, T);                   /* debugger writes of g / b, for the next frame: here, while the
-                                                   frame runs (the learning below writes its results directly) */
     }
-    /* the observer step, A2 and D4 (g = 1) of the pass that started it, as run_pass would have made them */
-    DAC1->DHR12R1 = buck_iload_dac(buck_obs_step_a(&m->obs, m->v, m->im, m->ok, BUCK_OBS_A));
-    GPIOB->BSRR = D4_PIN;
+    /* the pass that started it (its observer step, A2 and D4 are its own, Src/buck.c run_pass) */
     m->loops += 1U;
     m->v_prev = m->v;
     m->trig = 0U;                               /* a new request needs g to fall first */
@@ -281,6 +279,10 @@ TOC_CODE void buck_toc_finish(void)
         T->state = BUCK_TOCS_END;
         b->adc_v_raw = adc_v; b->adc_i4_raw = adc_i4;
         if (cmd != BUCK_RUN) { toc_exit(b, 0U, adc_v, adc_i4); return; }
+        /* debugger writes of g / b, for the next frame (the learning below writes its results directly):
+         * here, in P1's idle time after its CMP1 write (31 Oct; before the frame's end they could delay
+         * this pass of a short frame toward its deadline) */
+        toc_gains_take(m, T);
     }
 
     /* ---- 1: the sample after the first period: the PIs restart from it (user: the voltage PI's

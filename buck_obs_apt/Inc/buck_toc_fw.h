@@ -11,16 +11,16 @@
  * The sequence (one score edge; pass n reads the sample at the end of period n-1):
  *   n    run_pass: the PIs, CMP1 for n+1, the score. g rose and trig is set: the start
  *        (buck_toc_start_inline, Inc/buck_toc_start.h, inline in the pass: the save and restore of a
- *        call alone would take ~50 clocks of the period, README "Clock budget"): the first software
- *        update stretches period n into the frame (the A0 pair moved to its end, the first span's
- *        backstop), SST (ON-OFF) / SRT (OFF-ON): the first span runs; the L-C solve's first span;
- *        the second update (its end); the second span; the third update (the frame's end PER').
- *        The pass returns PASS_TOC (its observer, A2 and D4 are left to the TOC code).
- *        run_loop copies its state into the mailbox; buck_toc_finish(): the return words for the
- *        first normal period P1 (the held duty) into the preloads, the rest of pass n (observer,
- *        A2, D4), then
+ *        call alone would take ~50 clocks of the period, README "Clock budget"): SST (ON-OFF) / SRT
+ *        (OFF-ON): the first span runs; the L-C solve's first span; the first software update (the
+ *        span's end, period n stretched into the frame); the second span and the held duty; the
+ *        second update (the frame's end PER', the A0 pair moved to it; OFF-ON stretched to its
+ *        minimum: the tail), and right after it buck_toc_ret() (BUCK_TOC_CALL_CORE): the return words
+ *        for the first normal period P1 (the held duty) into the preloads. Then the pass's own
+ *        observer step, A2 and D4 (31 Oct: in the edge pass itself, Src/buck.c), and it returns
+ *        PASS_TOC. run_loop copies its state into the mailbox; buck_toc_finish():
  *   T    the sample at the frame's end (read in P1): z_v; CMP1 for P2 = the held duty again; the
- *        observer's v^ set to it;
+ *        observer's v^ set to it; the checks of debugger writes to g and b;
  *   1    the sample after P1 (read in P2): the voltage PI's integrator = P1's measured mean current
  *        (user: no reference learner), the current PI's = the held duty, then an ordinary pass (CMP1
  *        for P3, score, observer, A2, D4); the load over P1, I_load = i_P1 - (C/T)(v_1 - v_T): the
@@ -66,9 +66,13 @@ typedef struct {
     uint32_t per;               /* PER' */
     uint32_t t1, t2;            /* applied physical spans, ticks */
     uint32_t fail_cnt;          /* REQ_FAIL: the counter at the missed guard */
-    uint32_t hold_cmp;          /* CMP1 of the held duty (with DT; P1 after OFF-ON without) */
+    uint32_t hold_cmp;          /* CMP1 of the held duty (with DT: P2) */
+    uint32_t ret_cmp1;          /* P1's CMP1 (the return words): hold_cmp, after OFF-ON without DT (with the
+                                   tail with it) */
+    uint32_t t_end;             /* SAT_TAIL: the ON span's end (Timer A CMP1, the frame's counter) */
     float d_hold;               /* the held duty */
-    float v_mid;                /* the period's own A0 pair, converted inside the frame (dropped; telemetry) */
+    uint32_t v_mid_code;        /* the period's own A0 pair, converted inside the frame (dropped; telemetry): its
+                                   ADC1 code (buck_toc_ret has no floating point: BUCK_TOC_CALL_CORE) */
     buck_toc_sol_t sol;
     float g1, g2;               /* the gains of the spans (in use for this frame) */
 } buck_toc_frame_t;
@@ -98,16 +102,23 @@ typedef struct {
 
 extern buck_toc_mb_t g_toc_mb;
 
-void buck_toc_finish(void);     /* after the start: the return words, the rest of that pass and, with a
-                                   frame, its two samples */
+void buck_toc_finish(void);     /* after the start: the record, that pass's bookkeeping and, with a frame,
+                                   its two samples */
 void buck_toc_prime(void);      /* run_loop's entry: the constants for g_toc_mb.vref, the gains */
 void buck_toc_start_late(void); /* the first update's guard missed: the normal words back, a LATE reject */
-void buck_toc_ret(void);        /* after the third update: the return words, the period's own A0 result read */
+void buck_toc_ret(void);        /* after the second update: the return words, the period's own A0 result read
+                                   (BUCK_TOC_CALL_CORE: no floating-point register, make check rule 5d) */
 
 /* The call: every caller-saved register saved and restored here (8-byte aligned: 6 + 16 words). */
 #define BUCK_TOC_CALL(fn) \
     __asm__ volatile("push {r0-r3, r12, lr}\n\tvpush {s0-s15}\n\tbl " #fn "\n\tvpop {s0-s15}\n\tpop {r0-r3, r12, lr}" \
                      ::: "memory", "cc")
+
+/* The call of a function that uses no floating-point register (buck_toc_ret; make check rule 5d checks it):
+ * the caller-saved core registers only, 17 clocks less than BUCK_TOC_CALL before the call (31 Oct: on the
+ * path from the second update to the return words' guard). */
+#define BUCK_TOC_CALL_CORE(fn) \
+    __asm__ volatile("push {r0-r3, r12, lr}\n\tbl " #fn "\n\tpop {r0-r3, r12, lr}" ::: "memory", "cc")
 
 /* Guarded store: the Timer A counter (HRTIM base hr) is read and the store happens only if early <= cnt <
  * early + win; otherwise branch to missed (make check, rule 5c: this exact form). */

@@ -22,7 +22,7 @@ What the user asked for (30 Oct) and where it is
 | 1 | no delay: at the trigger cycle turn the top side on at once (step-up) or the bottom side (step-down) for at least the time the solve needs, feed-forward | `Inc/buck_toc_start.h`: the edge test runs before the pass's PIs, the SST/SRT is the first thing after it; the span's end comes from the solve (its minimum is the solve's time, ~0.51 us) |
 | 3 | the solve's initial condition: the measured i_L average and v_out | x0 = (i_avg, v_out) of the pass that saw the edge; I_eq = i_avg - (C/T)(v_out - v_out,prev) + b[order] |
 | 4 | the Jacobian is updated from the voltage error at the TOC's end and the difference over the first cycle after it; the first duty held | z_v = v_out(end) - V_ref; P1 (and P2, the pipeline) at the held duty (V_ref + r_L I_eq)/V_in. Since 4b the "difference" is split with P1's measured mean current i_P1: the landing z_i = i_P1 - I_eq for the timing (Newton step on g = {g_on, g_off}, `buck_toc_learn`), the equilibrium e = I_load - I_eq, I_load = i_P1 - (C/T)(v_1 - v_end), for b |
-| 4b | bring back the additive equilibrium correction: I_eq = estimate + b, b += mu_b (I_load - I_eq); split the work over cycles if needed | `buck_toc_learn_b` (mu_b 0.5, b within +-3 A, one per order); b at once (~10-15 clocks), the Jacobian step in two parts in the spare tails of the next ordinary passes, which the TOC code runs itself (`toc_pass`) |
+| 4b | bring back the additive equilibrium correction: I_eq = estimate + b, b += mu_b (I_load - I_eq); split the work over cycles if needed | `buck_toc_learn_b` (mu_b 0.5, b within +-3 A, one per order); b at once (~10-15 clocks), the Jacobian step in two parts (31 Oct: right after P1's sample, the duty held meanwhile; until then in the tails of ordinary passes the TOC code ran itself, `toc_pass`) |
 | 5 | i_ref = the first cycle's average current; no i_ref learner | the voltage PI's integrator := P1's measured mean current, the current PI's := the held duty, at the sample after P1; DeltaI, kappa, q and the old G bank are removed |
 | 31 Oct | the edge pass's observer step in the edge cycle itself (not deferred to the TOC code) | `Src/buck.c` run_pass: after the start (the frame's words and the return words are in), the observer step on the edge's sample, A2 and D4, as an ordinary pass makes them (~21 clocks, inside the frame, on every path of the start); `buck_toc_finish` no longer steps it |
 
@@ -59,16 +59,17 @@ Pass n reads the sample at the end of period n-1 (EOC ~1150 ticks into period n)
    the pass's observer step on the edge's sample, A2 and D4 (g = 1), as in an ordinary pass.
 6. `buck_toc_finish()` (after run_loop copied its state into the mailbox): **T** (the frame's end sample, read in
    P1): the frame-end transfer seen (MUPD, UPD), the grid locked (Timer A - master counter), CMP1 for P2 = the
-   held duty (guarded, fault 5 on a miss), z_v, the observer's v^ set to it; then, in P1's idle time, the checks of
-   debugger writes to `g` and `b` (`toc_gains_take`);
-   **1** (the sample after P1, read in P2, `toc_pass`): integ_v := P1's measured mean current, integ_i := the held
-   duty, an ordinary pass (both PIs, CMP1 for P3 guarded, score, observer, A2, D4); the residuals z_v, z_i, e and
-   the equilibrium correction b at once. **Learning in parts** (with `learn_enable`, P1's mean current >=
-   `BUCK_TOC_LEARN_IMIN_A` 0.5 A: A1 reads a negative valley as 0): the Jacobian step's span steps (part 1) and its
-   gains (part 2), each started only with the counter in [2048, 7488) and no sample pending; otherwise the TOC code
-   runs the next sample's ordinary pass first (`toc_pass`, at most 4). Typically: P3's pass, part 1 in its tail,
-   P4's pass, part 2 in its tail, then back to run_loop before P5's sample. The new gains and b take effect at the
-   next edge. A new request needs g to fall and BUCK_TOC_HOLDOFF_PASSES (128) passes (the telemetry pass re-enables).
+   held duty (guarded; skipped outside its window since 31 Oct), z_v, the observer's v^ set to it;
+   **1** (the sample after P1, read in P2): integ_v := P1's measured mean current, integ_i := the held duty, the
+   observer step and A2 on it, the residuals z_v, z_i, e and the equilibrium correction b at once; no PI pass and
+   no CMP1 write (31 Oct: the TOC code ran one, `toc_pass`, which on the board missed its deadline): the duty stays
+   held, and the loop's first pass after the hand-back steps the PIs from these integrators. **Learning** (with
+   `learn_enable`, P1's mean current >= `BUCK_TOC_LEARN_IMIN_A` 0.5 A: A1 reads a negative valley as 0; P1's
+   sample complete and without an overrun): the Jacobian step's span steps (part 1) and its gains (part 2) right
+   after, a sample that came meanwhile read after each with the duty held (`toc_keep`). The hand-back at or after
+   `BUCK_TOC_KEEP_FIRST` (4096 ticks) with that period's sample taken. The new gains and b take effect at the next
+   edge; debugger writes to `g` and `b` are taken at the next edge's end or the run's entry. A new request needs g
+   to fall and BUCK_TOC_HOLDOFF_PASSES (128) passes (the telemetry pass re-enables).
 The master's four current compares are untouched: they all fire once in the stretched period (ADC2's group stays
 four samples; its frame result is not used, and A1 cannot read negative current anyway).
 
@@ -122,6 +123,9 @@ peripheral wait states: add ~3 per HRTIM read, the bench of Part 2 measures them
 | learning part 1: gates, clips, Jacobian, 1/det, the span steps | ~96 | in P3's tail (start window 2048..7488) |
 | learning part 2: 1/(t1 t2), the gains, stores | ~90 | in P4's tail; back to run_loop before P5's sample |
 
+(The rows from T on are the static count before 31 Oct: on the board that code ran ~2 x these counts, the samples
+came ~2000 ticks into the period, and the restart pass missed its CMP1 deadline. Since then the TOC code runs no
+PI pass; see "31 Oct, on the board: the TOC code falls up to a period behind".)
 Without the split the Jacobian step (~190 clocks) after the restart pass would end ~170 clocks into P3 and push
 P3's CMP1 write to within a few clocks of its deadline (more with wait states). The checks of debugger writes to
 `g` and `b` (`toc_gains_take`, ~100 clocks) run in P1 after T's CMP1 write (31 Oct; before the frame's end they
@@ -165,17 +169,29 @@ the return words to T's wait ~390 clocks on the board, so after a short frame T 
 reading past the period's end, which read as an early sample until the log), the next ADC2 group (570 ticks into
 P2) ended between T's status read and its data reads (T's read cleared that EOC, the overrun stayed: fault 4 in
 the restart pass), or a CMP1 write landed outside its window (fault 5; the log's own polling made that run's T
-later still). Now:
+later still). A first fix (merged) made T tolerant (below) and let each of the TOC code's passes drop a late
+sample; on the board it then tripped fault 5 in the restart pass on a sample taken in time (2304 ticks): that pass
+took ~210 clocks from its sample to its CMP1 write (about 100 instructions; the TOC code runs ~2 x its count on the
+board, the main loop does not), and the samples themselves come ~2000 ticks into the period, not ~1150. Now:
 - `buck_toc_ret` drops ADC2's group of the frame itself (unused); T reads ADC1 only. An ADC1 overrun at T (T after
   P1's pair) is cleared and counted (`toc.t_lost`): the newest result goes to the observer, no learning.
-- T's CMP1 write outside its window is skipped (`toc.t_skip`; P1's return words, the held duty, stay until the
-  restart pass's CMP1; after OFF-ON without the tail that is DT shorter for that period) instead of fault 5.
-- Every pass the TOC code runs takes its sample only if its wait returned with the counter in
-  [`BUCK_TOC_F_EARLIEST`, `BUCK_TOC_PASS_LAST`) = [1024, 2688) ticks, both results there and no overrun; otherwise
-  it drops it (`toc.drop_n`; the CMP1 in force stays a period more) and takes the next, at most
-  `BUCK_TOC_DROP_MAX` (3) times, then fault 4 (site 3, `f4_bad` with 0x1). A drop in the restart pass means its
-  sample is not P1's: no learning from that frame either.
-- The event log keeps the waits' starts and the drops (no polling of the HRTIM flags: it slowed every wait).
+- T's CMP1 write outside its window is skipped (`toc.t_skip`; P1's return words, the held duty, stay; after OFF-ON
+  without the tail that is DT shorter for that period) instead of fault 5.
+- **The TOC code runs no PI pass.** P1's sample sets the PIs' integrators (as before: the voltage PI's = P1's
+  measured mean current, the current PI's = the held duty), steps the observer and gives the residuals, b and the
+  Jacobian step; the duty stays held, and the loop's first pass after the hand-back steps the PIs. A sample that
+  comes while the TOC code still works (the Jacobian step's two parts) is read with the duty held (`toc_keep`:
+  not before `BUCK_TOC_KEEP_FIRST` = 4096 ticks, both results of the period are in by then; the observer stepped
+  on it; counted in `toc.drop_n`), and the hand-back comes at or after 4096 ticks with the period's sample taken,
+  so that the loop's first pass gets the next sample early in its period. An overrun or a missing ADC2 result in
+  P1's sample: no learning from that frame.
+- The duty is held through P1 and P2 as before, and one more period: the loop's first PIs write CMP1 for P4 (P3
+  before), plus one period per `toc_keep` (with the Jacobian step on the board, about two). In the simulation
+  (`make toc-test`, the board's timing with two held periods while learning) dips and humps change by 0–3 mV, the
+  slewing-edge learning case by +9 mV (dip, static timing) and +6 mV (hump, board timing).
+- `g` / `b` written from the debugger are taken at the next edge's end or the run's entry (no longer after a
+  frame). The event log keeps the waits' starts, the held samples and T's skips (no polling of the HRTIM flags:
+  it slowed every wait).
 
 **31 Oct: the frame's end was too early for the return words.** Until 31 Oct PER' had to be only the A0 lead + one
 guard (3482 ticks, ~93 clocks) after c2, but from c2 to the return words' guard read were ~158 clocks static (the
@@ -287,28 +303,29 @@ Enabling (Live Expressions, after RUN)
    later, 16 with it the OFF-ON tail), `c_start`, `t1_ticks`, `t2_ticks` (with the tail: the ON span applied), `t1_model`, `t2_model`, `z_v`, `z_i` (landing), `i_load`, `e_b`, `b`,
    `i_first`, `g`, `learn_n`, `b_n`, `learn_low`, `learn_late`, `learn_skip`, `chk_commit`, `chk_align`. A fault 9 (`BUCK_FAULT_TOC`) means a frame write window or a hardware check failed.
 4. A fault 4 (`BUCK_FAULT_ADC`, 31 Oct diagnostics): `toc.f4_site` says where (0 the loop's own sample timeout, the
-   CPU then spins in `buck_fatal`; 1 a pass of the loop, bad sample; 2 T (a STOP only since 31 Oct); 3 the restart
-   or a learning pass, no usable sample within `BUCK_TOC_DROP_MAX` drops; 4 the TOC code's sample timeout; 5 the
-   period's own A0 result not converted inside the frame), `toc.f4_bad` which check (0x10 ADC1 overrun, 0x100000
-   ADC2 overrun, 0x40000 ADC2 without a result, 0x1 every sample too late),
+   CPU then spins in `buck_fatal`; 1 a pass of the loop, bad sample; 2 T and 3 P1's sample (a STOP only since
+   31 Oct); 4 the TOC code's sample timeout; 5 the period's own A0 result not converted inside the frame),
+   `toc.f4_bad` which check (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2 without a result),
    `toc.f4_csr` and `toc.f4_cnt` the ADC status and the Timer A counter there; with `toc.state`, `edges`,
    `frames`, `sat`, `c_start`, `per_ticks` and `adc_miss` (counted for sites 1-3 only).
 5. The frame's timing on the board (Timer A counter, ticks): `toc.c_start` (SST), `c_swu1`, `c2`, `c_swu2`,
-   `c_ret` (the frame's counter), `c_t` (T's CMP1, in P1), `c_first` (the restart pass's, in P2), `c_pass`, `c_back`
-   and `csr_back` (where the loop takes over; 0x4 set: its sample already waiting); `c_tw`, `c_rw` when T's and
-   the restart pass's samples arrived.
+   `c_ret` (the frame's counter), `c_t` (T's CMP1, in P1), `c_back` and `csr_back` (where the loop takes over;
+   0x4 set: its sample already waiting); `c_tw`, `c_rw` when T's and P1's samples were taken (`c_first`, `c_pass`
+   unused since 31 Oct).
 6. A fault through `buck_fatal` (a sample timeout: fault 4 with `f4_site` 0): `toc.fatal_lr` its caller (as
    `(void(*)(void))g_buck.toc.fatal_lr` the debugger shows the function), `fatal_prev` the fault before it (a trip
    the stopped loop then timed out after), `fatal_ta_per` / `fatal_ta_cnt` / `fatal_mper` / `fatal_mcnt` the timers,
    `fatal_adc1_cr` (ADSTART 0x4), `fatal_adc1_isr`, `fatal_adc2_isr`.
-7. The samples' arrival in the passes the TOC code ran after the last frame (`toc.pr_n` of them; 0 is T, 1 the
-   restart pass, then the learning and the two extra passes): `pr_c0[k]` the Timer A counter when the wait began,
+7. The samples' arrival in the waits of the TOC code after the last frame (`toc.pr_n` of them; 0 is T, 1 P1's
+   sample; `pr_c1` is read right after the wait, ~30 clocks before the probe's stores end): `pr_c0[k]` the Timer A
+   counter when the wait began,
    `pr_c2[k]` when ADC2's result was first seen (0xFFFF: already there), `pr_c1[k]` when ADC1's came, `pr_st[k]`
    ADC12_COMMON->CSR then (0x10 ADC1 overrun, 0x100000 ADC2 overrun, 0x40000 ADC2's result there).
 8. The event log of the last frame (31 Oct diagnostics): `toc.ev_n` entries of `toc.ev[k]`, from the return words'
-   guard (`toc.c_ret`, inside the frame) through the waits of the passes the TOC code runs. Each is
+   guard (`toc.c_ret`, inside the frame) through the TOC code's waits and held samples. Each is
    code << 23 | (CPU cycles since that guard, 12 bits) << 11 | Timer A counter / 32; code 0x100 a wait began,
-   0x80 a sample dropped, 0x10 T's CMP1 write skipped, 0x08 T's sample overwritten; with the ADC state there: 0x01
+   0x80 a sample read with the duty held, 0x10 T's CMP1 write skipped, 0x08 T's sample overwritten; with the
+   ADC state there: 0x01
    ADC1's result, 0x02 ADC2's, 0x20 / 0x40 their overruns.
    `python3 tools/decode_events.py --cret <c_ret> <ev[0]> <ev[1]> ...` prints it as a timeline (280 cycles per
    period). Counters over all frames: `toc.drop_n`, `toc.t_skip`, `toc.t_lost`.
@@ -363,9 +380,11 @@ update, the record after them), `Src/buck_toc.c` (`buck_toc_ret` without floatin
 rule 5d: the core-only call, its place, no FP in `buck_toc_ret`, the tail), `Tests/test_toc.c` (the frame's
 minimum and the tail as the firmware has them, the 1 A step). Later on 31 Oct: the event log (`Src/buck_toc.c`
 `toc_ev`, `toc_ret_tail`; `Inc/buck.h` `ev`; `tools/decode_events.py`) and the alignment reference inside the
-frame (`Inc/buck_toc_fw.h` `align`); the passes after a frame tolerate being late (`Src/buck_toc.c` `toc_sample`,
-T; `Inc/buck_toc_fw.h` `BUCK_TOC_PASS_LAST`, `BUCK_TOC_DROP_MAX`; `Inc/buck.h` `drop_n`, `t_skip`, `t_lost`;
-`tools/check_loop.py` rule 5c: T's CMP1 guard skips on a miss).
+frame (`Inc/buck_toc_fw.h` `align`); no PI pass in the TOC code after a frame, T tolerant of being late
+(`Src/buck_toc.c` `toc_keep`, T, P1's sample; `toc_pass`, `toc_sample` gone; `Inc/buck_toc_fw.h`
+`BUCK_TOC_KEEP_FIRST`, the learning windows and extra passes gone; `Inc/buck.h` `drop_n`, `t_skip`, `t_lost`;
+`tools/check_loop.py` rule 5c: T's CMP1 guard skips on a miss, no TOC PI pass; `Tests/test_toc.c`: the held
+restart, two held periods while learning with the board's timing).
 
 ---------------------------------------------------------------------------------------------
 

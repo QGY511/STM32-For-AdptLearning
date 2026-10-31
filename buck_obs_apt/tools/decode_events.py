@@ -10,7 +10,7 @@ One CPU cycle is 32 HRTIM ticks; a normal period is 8960 ticks (280 cycles)."""
 import sys
 
 STATE = [(0x01, 'ADC1 result'), (0x02, 'ADC2 result'), (0x20, 'ADC1 OVR'), (0x40, 'ADC2 OVR')]
-SEEN = [(0x100, 'wait began'), (0x80, 'sample dropped'), (0x10, "T's CMP1 skipped"), (0x08, "T's sample lost")]
+SEEN = [(0x100, 'wait began'), (0x80, 'sample read, duty held'), (0x10, "T's CMP1 skipped"), (0x08, "T's sample lost")]
 
 
 def main(argv):
